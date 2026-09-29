@@ -1,4 +1,6 @@
 mod hotplug;
+mod settings;
+mod virtual_camera;
 
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;
@@ -6,7 +8,8 @@ use tracing_subscriber::EnvFilter;
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     init_tracing();
-    hotplug::run().await
+    let (virtual_camera, producer_failures) = virtual_camera::VirtualCamera::prepare()?;
+    hotplug::run(virtual_camera, producer_failures).await
 }
 
 fn init_tracing() {

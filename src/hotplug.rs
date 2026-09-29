@@ -8,8 +8,11 @@ use std::{
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_udev::{AsyncMonitorSocket, Device, Enumerator, Event, EventType, MonitorBuilder};
 use tracing::{debug, info, warn};
+
+use crate::virtual_camera::{CameraOutput, VirtualCamera};
 
 const GOPRO_VENDOR_ID: u16 = 0x2672;
 
@@ -308,12 +311,15 @@ impl Lifecycle {
 
 /// Runs startup discovery and both udev event streams until shutdown or an
 /// unrecoverable monitoring failure occurs.
-pub(crate) async fn run() -> Result<()> {
+pub(crate) async fn run(
+    mut virtual_camera: VirtualCamera,
+    mut producer_failures: UnboundedReceiver<anyhow::Error>,
+) -> Result<()> {
     let mut usb_monitor = monitor_usb().context("failed to open USB udev monitor")?;
     let mut network_monitor = monitor_network().context("failed to open network udev monitor")?;
     let mut lifecycle = Lifecycle::default();
 
-    reconcile(&mut lifecycle, EventSource::Startup)
+    reconcile(&mut lifecycle, EventSource::Startup, &mut virtual_camera)
         .context("failed to enumerate devices during startup")?;
 
     info!(event = "hotplug_monitor_started", "hotplug monitor started");
@@ -326,24 +332,32 @@ pub(crate) async fn run() -> Result<()> {
             result = &mut shutdown => {
                 result?;
                 info!(event = "daemon_stopping", "shutdown signal received");
+                virtual_camera.stop().context("failed to stop virtual camera during shutdown")?;
                 return Ok(());
+            }
+            failure = producer_failures.recv() => {
+                let Some(error) = failure else {
+                    bail!("virtual camera producer failure channel closed unexpectedly");
+                };
+                virtual_camera.stop().context("failed to stop failed virtual camera producer")?;
+                return Err(error);
             }
             item = usb_monitor.next() => {
                 match item {
-                    Some(Ok(event)) => handle_usb_event(&mut lifecycle, &event)?,
+                    Some(Ok(event)) => handle_usb_event(&mut lifecycle, &event, &mut virtual_camera)?,
                     Some(Err(error)) => {
                         warn!(%error, event = "udev_receive_error", subsystem = "usb", "failed to receive USB udev event; reconciling");
-                        reconcile(&mut lifecycle, EventSource::Reconcile)?;
+                        reconcile(&mut lifecycle, EventSource::Reconcile, &mut virtual_camera)?;
                     }
                     None => bail!("USB udev monitor ended unexpectedly"),
                 }
             }
             item = network_monitor.next() => {
                 match item {
-                    Some(Ok(event)) => handle_network_event(&mut lifecycle, &event)?,
+                    Some(Ok(event)) => handle_network_event(&mut lifecycle, &event, &mut virtual_camera)?,
                     Some(Err(error)) => {
                         warn!(%error, event = "udev_receive_error", subsystem = "net", "failed to receive network udev event; reconciling");
-                        reconcile(&mut lifecycle, EventSource::Reconcile)?;
+                        reconcile(&mut lifecycle, EventSource::Reconcile, &mut virtual_camera)?;
                     }
                     None => bail!("network udev monitor ended unexpectedly"),
                 }
@@ -368,7 +382,11 @@ fn monitor_network() -> Result<AsyncMonitorSocket> {
 
 /// Converts one USB udev event into a lifecycle observation and reconciles
 /// remaining cameras after the active camera disconnects.
-fn handle_usb_event(lifecycle: &mut Lifecycle, event: &Event) -> Result<()> {
+fn handle_usb_event(
+    lifecycle: &mut Lifecycle,
+    event: &Event,
+    virtual_camera: &mut VirtualCamera,
+) -> Result<()> {
     let usb_path = event.syspath().to_path_buf();
     let observation = match event.event_type() {
         EventType::Add | EventType::Bind | EventType::Change => {
@@ -388,10 +406,10 @@ fn handle_usb_event(lifecycle: &mut Lifecycle, event: &Event) -> Result<()> {
     };
 
     let active_was_removed = matches!(&observation, Observation::UsbRemoved { usb_path } if lifecycle.active.as_ref().is_some_and(|active| active.identity.usb_path == *usb_path));
-    emit_all(lifecycle.apply(observation));
+    dispatch_all(lifecycle.apply(observation), virtual_camera)?;
 
     if active_was_removed && !lifecycle.has_active_camera() {
-        reconcile(lifecycle, EventSource::Reconcile)?;
+        reconcile(lifecycle, EventSource::Reconcile, virtual_camera)?;
     }
 
     Ok(())
@@ -399,7 +417,11 @@ fn handle_usb_event(lifecycle: &mut Lifecycle, event: &Event) -> Result<()> {
 
 /// Converts one network udev event into lifecycle observations, ensuring the
 /// owning USB camera is observed before its interface.
-fn handle_network_event(lifecycle: &mut Lifecycle, event: &Event) -> Result<()> {
+fn handle_network_event(
+    lifecycle: &mut Lifecycle,
+    event: &Event,
+    virtual_camera: &mut VirtualCamera,
+) -> Result<()> {
     let event_type = event.event_type();
     if matches!(
         event_type,
@@ -416,12 +438,18 @@ fn handle_network_event(lifecycle: &mut Lifecycle, event: &Event) -> Result<()> 
         if let Some(parent) = gopro_usb_parent(event)?
             && let Some(camera) = CameraIdentity::from_device(&parent)
         {
-            emit_all(lifecycle.apply(Observation::UsbUpsert {
-                camera,
-                source: EventSource::Udev,
-            }));
+            dispatch_all(
+                lifecycle.apply(Observation::UsbUpsert {
+                    camera,
+                    source: EventSource::Udev,
+                }),
+                virtual_camera,
+            )?;
         }
-        emit_all(lifecycle.apply(Observation::NetworkUpsert(network)));
+        dispatch_all(
+            lifecycle.apply(Observation::NetworkUpsert(network)),
+            virtual_camera,
+        )?;
         return Ok(());
     }
 
@@ -440,7 +468,7 @@ fn handle_network_event(lifecycle: &mut Lifecycle, event: &Event) -> Result<()> 
             ifindex: property(event, "IFINDEX").and_then(|value| value.parse().ok()),
             usb_path,
         };
-        emit_all(lifecycle.apply(observation));
+        dispatch_all(lifecycle.apply(observation), virtual_camera)?;
         return Ok(());
     }
 
@@ -451,7 +479,11 @@ fn handle_network_event(lifecycle: &mut Lifecycle, event: &Event) -> Result<()> 
 
 /// Rebuilds lifecycle state from the current sysfs inventory to cover startup,
 /// missed events, and promotion of an already-connected secondary camera.
-fn reconcile(lifecycle: &mut Lifecycle, source: EventSource) -> Result<()> {
+fn reconcile(
+    lifecycle: &mut Lifecycle,
+    source: EventSource,
+    virtual_camera: &mut VirtualCamera,
+) -> Result<()> {
     let mut cameras = enumerate_usb_cameras()?;
     cameras.sort_by(|left, right| left.usb_path.cmp(&right.usb_path));
 
@@ -468,13 +500,19 @@ fn reconcile(lifecycle: &mut Lifecycle, source: EventSource) -> Result<()> {
         .map(|active| active.identity.usb_path.clone())
         && !present_paths.contains(&active_path)
     {
-        emit_all(lifecycle.apply(Observation::UsbRemoved {
-            usb_path: active_path,
-        }));
+        dispatch_all(
+            lifecycle.apply(Observation::UsbRemoved {
+                usb_path: active_path,
+            }),
+            virtual_camera,
+        )?;
     }
 
     for camera in cameras {
-        emit_all(lifecycle.apply(Observation::UsbUpsert { camera, source }));
+        dispatch_all(
+            lifecycle.apply(Observation::UsbUpsert { camera, source }),
+            virtual_camera,
+        )?;
     }
 
     let mut networks = enumerate_gopro_networks()?;
@@ -492,16 +530,22 @@ fn reconcile(lifecycle: &mut Lifecycle, source: EventSource) -> Result<()> {
             .as_ref()
             .and_then(|active| active.network.clone())
     {
-        emit_all(lifecycle.apply(Observation::NetworkRemoved {
-            sysfs_path: current.sysfs_path,
-            name: Some(current.name),
-            ifindex: current.ifindex,
-            usb_path: Some(current.usb_path),
-        }));
+        dispatch_all(
+            lifecycle.apply(Observation::NetworkRemoved {
+                sysfs_path: current.sysfs_path,
+                name: Some(current.name),
+                ifindex: current.ifindex,
+                usb_path: Some(current.usb_path),
+            }),
+            virtual_camera,
+        )?;
     }
 
     for network in networks {
-        emit_all(lifecycle.apply(Observation::NetworkUpsert(network)));
+        dispatch_all(
+            lifecycle.apply(Observation::NetworkUpsert(network)),
+            virtual_camera,
+        )?;
     }
 
     Ok(())
@@ -556,11 +600,14 @@ fn closest_usb_driver(device: &Device) -> Option<String> {
     None
 }
 
-/// Writes semantic lifecycle events as structured tracing records.
-fn emit_all(events: Vec<LifecycleEvent>) {
+/// Applies camera side effects and then writes each semantic transition to logs.
+fn dispatch_all(events: Vec<LifecycleEvent>, camera_output: &mut impl CameraOutput) -> Result<()> {
     for event in events {
         match event {
             LifecycleEvent::CameraConnected { camera, source } => {
+                camera_output
+                    .start()
+                    .context("failed to start virtual camera for connected GoPro")?;
                 info!(
                     event = "camera_connected",
                     source = %source,
@@ -624,6 +671,9 @@ fn emit_all(events: Vec<LifecycleEvent>) {
                 );
             }
             LifecycleEvent::CameraDisconnected(camera) => {
+                camera_output
+                    .stop()
+                    .context("failed to stop virtual camera for disconnected GoPro")?;
                 info!(
                     event = "camera_disconnected",
                     model = camera.model.as_deref().unwrap_or("unknown"),
@@ -635,6 +685,8 @@ fn emit_all(events: Vec<LifecycleEvent>) {
             }
         }
     }
+
+    Ok(())
 }
 
 /// Formats a camera's USB vendor and product IDs for logs.
@@ -688,6 +740,28 @@ async fn shutdown_signal() -> Result<()> {
 mod tests {
     use super::*;
 
+    #[derive(Debug, Default)]
+    struct MockCameraOutput {
+        starts: usize,
+        stops: usize,
+        fail_start: bool,
+    }
+
+    impl CameraOutput for MockCameraOutput {
+        fn start(&mut self) -> Result<()> {
+            if self.fail_start {
+                bail!("synthetic start failure");
+            }
+            self.starts += 1;
+            Ok(())
+        }
+
+        fn stop(&mut self) -> Result<()> {
+            self.stops += 1;
+            Ok(())
+        }
+    }
+
     /// Creates a complete synthetic GoPro identity for lifecycle tests.
     fn camera(path: &str, serial: Option<&str>) -> CameraIdentity {
         CameraIdentity {
@@ -713,6 +787,52 @@ mod tests {
             driver: Some("cdc_ncm".to_owned()),
             usb_path: PathBuf::from(usb_path),
         }
+    }
+
+    /// Verifies only physical camera presence transitions control frame output.
+    #[test]
+    fn dispatch_starts_and_stops_output_only_for_camera_presence() {
+        let identity = camera("/sys/camera-a", Some("C123"));
+        let interface = network("/sys/net/enx1", "/sys/camera-a", "enx1");
+        let mut output = MockCameraOutput::default();
+
+        dispatch_all(
+            vec![
+                LifecycleEvent::CameraConnected {
+                    camera: identity.clone(),
+                    source: EventSource::Startup,
+                },
+                LifecycleEvent::NetworkReady(interface.clone()),
+                LifecycleEvent::NetworkDetached(interface),
+                LifecycleEvent::CameraDisconnected(identity),
+            ],
+            &mut output,
+        )
+        .unwrap();
+
+        assert_eq!(output.starts, 1);
+        assert_eq!(output.stops, 1);
+    }
+
+    /// Verifies a producer setup failure aborts lifecycle dispatch immediately.
+    #[test]
+    fn dispatch_propagates_virtual_camera_start_failure() {
+        let mut output = MockCameraOutput {
+            fail_start: true,
+            ..MockCameraOutput::default()
+        };
+
+        let error = dispatch_all(
+            vec![LifecycleEvent::CameraConnected {
+                camera: camera("/sys/camera-a", None),
+                source: EventSource::Udev,
+            }],
+            &mut output,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("failed to start virtual camera"));
+        assert_eq!(output.starts, 0);
     }
 
     /// Verifies a complete hotplug cycle can repeat without resetting state.
