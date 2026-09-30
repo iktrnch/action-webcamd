@@ -149,37 +149,147 @@ enum Observation {
     },
 }
 
-/// A semantic state transition emitted by the lifecycle reducer for logging
-/// and, later, for triggering higher-level camera management behavior.
+/// The explicit lifecycle of the selected GoPro session.
+///
+/// `DeviceDetected` and `Ready` are deliberate, observable transition points;
+/// the reducer immediately advances them to `WaitingForNetwork` and
+/// `Streaming` respectively because this milestone has no asynchronous GoPro
+/// configuration step between those states.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+enum CameraState {
+    #[default]
+    Disconnected,
+    DeviceDetected {
+        camera: CameraIdentity,
+    },
+    WaitingForNetwork {
+        camera: CameraIdentity,
+    },
+    Ready {
+        camera: CameraIdentity,
+        network: NetworkInterface,
+    },
+    Streaming {
+        camera: CameraIdentity,
+        network: NetworkInterface,
+    },
+}
+
+impl CameraState {
+    /// Returns the stable, data-free name used in transition records and logs.
+    fn kind(&self) -> CameraStateKind {
+        match self {
+            Self::Disconnected => CameraStateKind::Disconnected,
+            Self::DeviceDetected { .. } => CameraStateKind::DeviceDetected,
+            Self::WaitingForNetwork { .. } => CameraStateKind::WaitingForNetwork,
+            Self::Ready { .. } => CameraStateKind::Ready,
+            Self::Streaming { .. } => CameraStateKind::Streaming,
+        }
+    }
+
+    /// Returns the selected physical camera, if a session exists.
+    fn camera(&self) -> Option<&CameraIdentity> {
+        match self {
+            Self::Disconnected => None,
+            Self::DeviceDetected { camera }
+            | Self::WaitingForNetwork { camera }
+            | Self::Ready { camera, .. }
+            | Self::Streaming { camera, .. } => Some(camera),
+        }
+    }
+
+    /// Returns the selected USB-network interface once it has been observed.
+    fn network(&self) -> Option<&NetworkInterface> {
+        match self {
+            Self::Ready { network, .. } | Self::Streaming { network, .. } => Some(network),
+            Self::Disconnected | Self::DeviceDetected { .. } | Self::WaitingForNetwork { .. } => {
+                None
+            }
+        }
+    }
+
+    /// Refreshes USB metadata while preserving the current lifecycle phase.
+    fn replace_camera(&mut self, camera: CameraIdentity) {
+        match self {
+            Self::Disconnected => {}
+            Self::DeviceDetected {
+                camera: current_camera,
+            }
+            | Self::WaitingForNetwork {
+                camera: current_camera,
+            }
+            | Self::Ready {
+                camera: current_camera,
+                ..
+            }
+            | Self::Streaming {
+                camera: current_camera,
+                ..
+            } => *current_camera = camera,
+        }
+    }
+
+    /// Refreshes network metadata while preserving the ready or streaming phase.
+    fn replace_network(&mut self, network: NetworkInterface) {
+        match self {
+            Self::Ready {
+                network: current_network,
+                ..
+            }
+            | Self::Streaming {
+                network: current_network,
+                ..
+            } => *current_network = network,
+            Self::Disconnected | Self::DeviceDetected { .. } | Self::WaitingForNetwork { .. } => {}
+        }
+    }
+}
+
+/// Data-free state names make transition assertions and structured logs stable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CameraStateKind {
+    Disconnected,
+    DeviceDetected,
+    WaitingForNetwork,
+    Ready,
+    Streaming,
+}
+
+impl fmt::Display for CameraStateKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Disconnected => "disconnected",
+            Self::DeviceDetected => "device_detected",
+            Self::WaitingForNetwork => "waiting_for_network",
+            Self::Ready => "ready",
+            Self::Streaming => "streaming",
+        })
+    }
+}
+
+/// A semantic transition emitted by the lifecycle reducer for output control
+/// and structured logs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LifecycleEvent {
-    CameraConnected {
-        camera: CameraIdentity,
-        source: EventSource,
+    StateTransition {
+        from: CameraStateKind,
+        to: CameraStateKind,
+        camera: Option<CameraIdentity>,
+        network: Option<NetworkInterface>,
+        source: Option<EventSource>,
     },
     CameraIgnored(CameraIdentity),
-    NetworkReady(NetworkInterface),
     NetworkUpdated {
         previous: NetworkInterface,
         current: NetworkInterface,
     },
-    NetworkDetached(NetworkInterface),
-    CameraDisconnected(CameraIdentity),
-}
-
-/// The currently selected GoPro together with its optional correlated network
-/// interface while the daemon supports a single active camera.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ActiveCamera {
-    identity: CameraIdentity,
-    network: Option<NetworkInterface>,
 }
 
 /// Reduces normalized observations into idempotent camera lifecycle events and
 /// tracks additional GoPros that are ignored while one camera is active.
 #[derive(Debug, Default)]
 struct Lifecycle {
-    active: Option<ActiveCamera>,
+    state: CameraState,
     ignored: HashSet<PathBuf>,
 }
 
@@ -207,9 +317,9 @@ impl Lifecycle {
         camera: CameraIdentity,
         source: EventSource,
     ) -> Vec<LifecycleEvent> {
-        if let Some(active) = self.active.as_mut() {
-            if active.identity.usb_path == camera.usb_path {
-                active.identity = camera;
+        if let Some(active_camera) = self.state.camera() {
+            if active_camera.usb_path == camera.usb_path {
+                self.state.replace_camera(camera);
                 return Vec::new();
             }
 
@@ -221,58 +331,78 @@ impl Lifecycle {
         }
 
         self.ignored.remove(&camera.usb_path);
-        self.active = Some(ActiveCamera {
-            identity: camera.clone(),
-            network: None,
-        });
-        vec![LifecycleEvent::CameraConnected { camera, source }]
+        vec![
+            self.transition(
+                CameraState::DeviceDetected {
+                    camera: camera.clone(),
+                },
+                Some(source),
+            ),
+            self.transition(CameraState::WaitingForNetwork { camera }, Some(source)),
+        ]
     }
 
-    /// Removes the camera at a USB path and emits interface-detached and
-    /// camera-disconnected events when it was the active camera.
+    /// Ends the selected session when its physical USB device disappears.
     fn remove_camera(&mut self, usb_path: &Path) -> Vec<LifecycleEvent> {
         self.ignored.remove(usb_path);
 
         if self
-            .active
-            .as_ref()
-            .is_none_or(|active| active.identity.usb_path != usb_path)
+            .state
+            .camera()
+            .is_none_or(|camera| camera.usb_path != usb_path)
         {
             return Vec::new();
         }
 
-        let active = self.active.take().expect("active camera was checked");
-        let mut events = Vec::with_capacity(2);
-        if let Some(network) = active.network {
-            events.push(LifecycleEvent::NetworkDetached(network));
-        }
-        events.push(LifecycleEvent::CameraDisconnected(active.identity));
-        events
+        vec![self.transition(CameraState::Disconnected, None)]
     }
 
-    /// Attaches or updates a network interface only when it belongs to the
-    /// active GoPro.
+    /// Advances a selected camera to streaming when its USB network appears,
+    /// or refreshes network metadata without restarting an active stream.
     fn upsert_network(&mut self, network: NetworkInterface) -> Vec<LifecycleEvent> {
-        let Some(active) = self.active.as_mut() else {
+        let Some(active_camera) = self.state.camera() else {
             return Vec::new();
         };
 
-        if active.identity.usb_path != network.usb_path {
+        if active_camera.usb_path != network.usb_path {
             return Vec::new();
         }
 
-        match active.network.replace(network.clone()) {
-            None => vec![LifecycleEvent::NetworkReady(network)],
-            Some(previous) if previous == network => Vec::new(),
-            Some(previous) => vec![LifecycleEvent::NetworkUpdated {
-                previous,
-                current: network,
-            }],
+        match &self.state {
+            CameraState::DeviceDetected { .. } | CameraState::WaitingForNetwork { .. } => {
+                let camera = active_camera.clone();
+                vec![
+                    self.transition(
+                        CameraState::Ready {
+                            camera: camera.clone(),
+                            network: network.clone(),
+                        },
+                        None,
+                    ),
+                    self.transition(CameraState::Streaming { camera, network }, None),
+                ]
+            }
+            CameraState::Ready {
+                network: previous, ..
+            }
+            | CameraState::Streaming {
+                network: previous, ..
+            } => {
+                if previous == &network {
+                    return Vec::new();
+                }
+                let previous = previous.clone();
+                self.state.replace_network(network.clone());
+                vec![LifecycleEvent::NetworkUpdated {
+                    previous,
+                    current: network,
+                }]
+            }
+            CameraState::Disconnected => Vec::new(),
         }
     }
 
-    /// Detaches the active GoPro's network interface when any stable event
-    /// identifier matches the cached interface.
+    /// Ends the selected session when its known USB-network interface vanishes.
     fn remove_network(
         &mut self,
         sysfs_path: &Path,
@@ -280,10 +410,7 @@ impl Lifecycle {
         ifindex: Option<u32>,
         usb_path: Option<&Path>,
     ) -> Vec<LifecycleEvent> {
-        let Some(active) = self.active.as_mut() else {
-            return Vec::new();
-        };
-        let Some(current) = active.network.as_ref() else {
+        let Some(current) = self.state.network() else {
             return Vec::new();
         };
 
@@ -296,16 +423,38 @@ impl Lifecycle {
             return Vec::new();
         }
 
-        let detached = active
-            .network
-            .take()
-            .expect("network interface was checked");
-        vec![LifecycleEvent::NetworkDetached(detached)]
+        vec![self.transition(CameraState::Disconnected, None)]
     }
 
-    /// Reports whether the daemon currently has a selected GoPro.
+    /// Records a state transition after retaining snapshots useful after unplug.
+    fn transition(&mut self, next: CameraState, source: Option<EventSource>) -> LifecycleEvent {
+        let from = self.state.kind();
+        let to = next.kind();
+        let camera = next.camera().or_else(|| self.state.camera()).cloned();
+        let network = next.network().or_else(|| self.state.network()).cloned();
+        self.state = next;
+        LifecycleEvent::StateTransition {
+            from,
+            to,
+            camera,
+            network,
+            source,
+        }
+    }
+
+    /// Returns the selected physical camera while a session exists.
+    fn selected_camera(&self) -> Option<&CameraIdentity> {
+        self.state.camera()
+    }
+
+    /// Returns the selected network interface once it is ready or streaming.
+    fn selected_network(&self) -> Option<&NetworkInterface> {
+        self.state.network()
+    }
+
+    /// Reports whether the daemon currently has a selected GoPro session.
     fn has_active_camera(&self) -> bool {
-        self.active.is_some()
+        self.selected_camera().is_some()
     }
 }
 
@@ -405,7 +554,7 @@ fn handle_usb_event(
         }
     };
 
-    let active_was_removed = matches!(&observation, Observation::UsbRemoved { usb_path } if lifecycle.active.as_ref().is_some_and(|active| active.identity.usb_path == *usb_path));
+    let active_was_removed = matches!(&observation, Observation::UsbRemoved { usb_path } if lifecycle.selected_camera().is_some_and(|camera| camera.usb_path == *usb_path));
     dispatch_all(lifecycle.apply(observation), virtual_camera)?;
 
     if active_was_removed && !lifecycle.has_active_camera() {
@@ -458,9 +607,8 @@ fn handle_network_event(
             .map(|parent| parent.syspath().to_path_buf())
             .or_else(|| {
                 lifecycle
-                    .active
-                    .as_ref()
-                    .map(|active| active.identity.usb_path.clone())
+                    .selected_camera()
+                    .map(|camera| camera.usb_path.clone())
             });
         let observation = Observation::NetworkRemoved {
             sysfs_path: event.syspath().to_path_buf(),
@@ -484,7 +632,21 @@ fn reconcile(
     source: EventSource,
     virtual_camera: &mut VirtualCamera,
 ) -> Result<()> {
-    let mut cameras = enumerate_usb_cameras()?;
+    let cameras = enumerate_usb_cameras()?;
+    let networks = enumerate_gopro_networks()?;
+    reconcile_inventory(lifecycle, source, cameras, networks, virtual_camera)
+}
+
+/// Applies one complete sysfs inventory in the same order used at daemon
+/// startup and after monitor recovery. Keeping this separate from udev makes
+/// already-connected-camera startup behavior unit-testable.
+fn reconcile_inventory(
+    lifecycle: &mut Lifecycle,
+    source: EventSource,
+    mut cameras: Vec<CameraIdentity>,
+    mut networks: Vec<NetworkInterface>,
+    camera_output: &mut impl CameraOutput,
+) -> Result<()> {
     cameras.sort_by(|left, right| left.usb_path.cmp(&right.usb_path));
 
     let present_paths: HashSet<_> = cameras
@@ -495,40 +657,33 @@ fn reconcile(
         .ignored
         .retain(|usb_path| present_paths.contains(usb_path));
     if let Some(active_path) = lifecycle
-        .active
-        .as_ref()
-        .map(|active| active.identity.usb_path.clone())
+        .selected_camera()
+        .map(|camera| camera.usb_path.clone())
         && !present_paths.contains(&active_path)
     {
         dispatch_all(
             lifecycle.apply(Observation::UsbRemoved {
                 usb_path: active_path,
             }),
-            virtual_camera,
+            camera_output,
         )?;
     }
 
     for camera in cameras {
         dispatch_all(
             lifecycle.apply(Observation::UsbUpsert { camera, source }),
-            virtual_camera,
+            camera_output,
         )?;
     }
 
-    let mut networks = enumerate_gopro_networks()?;
     networks.sort_by(|left, right| left.sysfs_path.cmp(&right.sysfs_path));
-    let active_network_present = lifecycle.active.as_ref().and_then(|active| {
-        active.network.as_ref().map(|current| {
-            networks
-                .iter()
-                .any(|network| network.sysfs_path == current.sysfs_path)
-        })
+    let active_network_present = lifecycle.selected_network().map(|current| {
+        networks
+            .iter()
+            .any(|network| network.sysfs_path == current.sysfs_path)
     });
     if active_network_present == Some(false)
-        && let Some(current) = lifecycle
-            .active
-            .as_ref()
-            .and_then(|active| active.network.clone())
+        && let Some(current) = lifecycle.selected_network().cloned()
     {
         dispatch_all(
             lifecycle.apply(Observation::NetworkRemoved {
@@ -537,14 +692,14 @@ fn reconcile(
                 ifindex: current.ifindex,
                 usb_path: Some(current.usb_path),
             }),
-            virtual_camera,
+            camera_output,
         )?;
     }
 
     for network in networks {
         dispatch_all(
             lifecycle.apply(Observation::NetworkUpsert(network)),
-            virtual_camera,
+            camera_output,
         )?;
     }
 
@@ -600,26 +755,43 @@ fn closest_usb_driver(device: &Device) -> Option<String> {
     None
 }
 
-/// Applies camera side effects and then writes each semantic transition to logs.
+/// Applies output side effects at state boundaries and logs every transition.
 fn dispatch_all(events: Vec<LifecycleEvent>, camera_output: &mut impl CameraOutput) -> Result<()> {
     for event in events {
         match event {
-            LifecycleEvent::CameraConnected { camera, source } => {
-                camera_output
-                    .start()
-                    .context("failed to start virtual camera for connected GoPro")?;
+            LifecycleEvent::StateTransition {
+                from,
+                to,
+                camera,
+                network,
+                source,
+            } => {
+                if to == CameraStateKind::DeviceDetected {
+                    camera_output
+                        .start()
+                        .context("failed to start virtual camera for detected GoPro")?;
+                }
+                if to == CameraStateKind::Disconnected && from != CameraStateKind::Disconnected {
+                    camera_output
+                        .stop()
+                        .context("failed to stop virtual camera for disconnected GoPro")?;
+                }
+
+                let camera = camera.as_ref();
+                let network = network.as_ref();
                 info!(
-                    event = "camera_connected",
-                    source = %source,
-                    model = camera.model.as_deref().unwrap_or("unknown"),
-                    manufacturer = camera.manufacturer.as_deref().unwrap_or("unknown"),
-                    serial = camera.serial.as_deref().unwrap_or("unknown"),
-                    usb_id = %usb_id(&camera),
-                    usb_path = %camera.usb_path.display(),
-                    physical_path = camera.physical_path.as_deref().unwrap_or("unknown"),
-                    bus = camera.bus_number.map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
-                    device = camera.device_number.map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
-                    "GoPro connected; waiting for its USB network interface"
+                    event = "camera_state_transition",
+                    from = %from,
+                    to = %to,
+                    source = source.map(|value| value.to_string()).as_deref().unwrap_or("unknown"),
+                    model = camera.and_then(|value| value.model.as_deref()).unwrap_or("unknown"),
+                    manufacturer = camera.and_then(|value| value.manufacturer.as_deref()).unwrap_or("unknown"),
+                    serial = camera.and_then(|value| value.serial.as_deref()).unwrap_or("unknown"),
+                    usb_id = camera.map(usb_id).unwrap_or_else(|| "unknown".to_owned()),
+                    usb_path = camera.map(|value| value.usb_path.display().to_string()).unwrap_or_else(|| "unknown".to_owned()),
+                    interface = network.map(|value| value.name.as_str()).unwrap_or("unknown"),
+                    ifindex = network.and_then(|value| value.ifindex).map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
+                    "GoPro lifecycle state changed"
                 );
             }
             LifecycleEvent::CameraIgnored(camera) => {
@@ -633,18 +805,6 @@ fn dispatch_all(events: Vec<LifecycleEvent>, camera_output: &mut impl CameraOutp
                     "additional GoPro ignored while another camera is active"
                 );
             }
-            LifecycleEvent::NetworkReady(network) => {
-                info!(
-                    event = "network_interface_ready",
-                    interface = %network.name,
-                    ifindex = network.ifindex.map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
-                    mac = network.mac_address.as_deref().unwrap_or("unknown"),
-                    driver = network.driver.as_deref().unwrap_or("unknown"),
-                    network_path = %network.sysfs_path.display(),
-                    usb_path = %network.usb_path.display(),
-                    "GoPro USB network interface ready"
-                );
-            }
             LifecycleEvent::NetworkUpdated { previous, current } => {
                 info!(
                     event = "network_interface_updated",
@@ -656,31 +816,6 @@ fn dispatch_all(events: Vec<LifecycleEvent>, camera_output: &mut impl CameraOutp
                     network_path = %current.sysfs_path.display(),
                     usb_path = %current.usb_path.display(),
                     "GoPro USB network interface metadata changed"
-                );
-            }
-            LifecycleEvent::NetworkDetached(network) => {
-                info!(
-                    event = "network_interface_detached",
-                    interface = %network.name,
-                    ifindex = network.ifindex.map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
-                    mac = network.mac_address.as_deref().unwrap_or("unknown"),
-                    driver = network.driver.as_deref().unwrap_or("unknown"),
-                    network_path = %network.sysfs_path.display(),
-                    usb_path = %network.usb_path.display(),
-                    "GoPro USB network interface detached"
-                );
-            }
-            LifecycleEvent::CameraDisconnected(camera) => {
-                camera_output
-                    .stop()
-                    .context("failed to stop virtual camera for disconnected GoPro")?;
-                info!(
-                    event = "camera_disconnected",
-                    model = camera.model.as_deref().unwrap_or("unknown"),
-                    serial = camera.serial.as_deref().unwrap_or("unknown"),
-                    usb_id = %usb_id(&camera),
-                    usb_path = %camera.usb_path.display(),
-                    "GoPro disconnected"
                 );
             }
         }
@@ -789,22 +924,61 @@ mod tests {
         }
     }
 
-    /// Verifies only physical camera presence transitions control frame output.
+    fn transition_kinds(events: &[LifecycleEvent]) -> Vec<(CameraStateKind, CameraStateKind)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                LifecycleEvent::StateTransition { from, to, .. } => Some((*from, *to)),
+                LifecycleEvent::CameraIgnored(_) | LifecycleEvent::NetworkUpdated { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Verifies black output starts at USB detection and stops only on session
+    /// teardown, rather than at the intermediate network states.
     #[test]
-    fn dispatch_starts_and_stops_output_only_for_camera_presence() {
+    fn dispatch_starts_at_detection_and_stops_at_disconnection() {
         let identity = camera("/sys/camera-a", Some("C123"));
         let interface = network("/sys/net/enx1", "/sys/camera-a", "enx1");
         let mut output = MockCameraOutput::default();
 
         dispatch_all(
             vec![
-                LifecycleEvent::CameraConnected {
-                    camera: identity.clone(),
-                    source: EventSource::Startup,
+                LifecycleEvent::StateTransition {
+                    from: CameraStateKind::Disconnected,
+                    to: CameraStateKind::DeviceDetected,
+                    camera: Some(identity.clone()),
+                    network: None,
+                    source: Some(EventSource::Startup),
                 },
-                LifecycleEvent::NetworkReady(interface.clone()),
-                LifecycleEvent::NetworkDetached(interface),
-                LifecycleEvent::CameraDisconnected(identity),
+                LifecycleEvent::StateTransition {
+                    from: CameraStateKind::DeviceDetected,
+                    to: CameraStateKind::WaitingForNetwork,
+                    camera: Some(identity.clone()),
+                    network: None,
+                    source: Some(EventSource::Startup),
+                },
+                LifecycleEvent::StateTransition {
+                    from: CameraStateKind::WaitingForNetwork,
+                    to: CameraStateKind::Ready,
+                    camera: Some(identity.clone()),
+                    network: Some(interface.clone()),
+                    source: None,
+                },
+                LifecycleEvent::StateTransition {
+                    from: CameraStateKind::Ready,
+                    to: CameraStateKind::Streaming,
+                    camera: Some(identity.clone()),
+                    network: Some(interface.clone()),
+                    source: None,
+                },
+                LifecycleEvent::StateTransition {
+                    from: CameraStateKind::Streaming,
+                    to: CameraStateKind::Disconnected,
+                    camera: Some(identity),
+                    network: Some(interface),
+                    source: None,
+                },
             ],
             &mut output,
         )
@@ -823,9 +997,12 @@ mod tests {
         };
 
         let error = dispatch_all(
-            vec![LifecycleEvent::CameraConnected {
-                camera: camera("/sys/camera-a", None),
-                source: EventSource::Udev,
+            vec![LifecycleEvent::StateTransition {
+                from: CameraStateKind::Disconnected,
+                to: CameraStateKind::DeviceDetected,
+                camera: Some(camera("/sys/camera-a", None)),
+                network: None,
+                source: Some(EventSource::Udev),
             }],
             &mut output,
         )
@@ -835,50 +1012,47 @@ mod tests {
         assert_eq!(output.starts, 0);
     }
 
-    /// Verifies a complete hotplug cycle can repeat without resetting state.
+    /// Verifies the requested state sequence and exact black-output boundary.
     #[test]
-    fn connects_attaches_detaches_and_reconnects() {
+    fn usb_and_network_observations_reach_streaming() {
         let mut lifecycle = Lifecycle::default();
         let first = camera("/sys/camera-a", Some("C123"));
         let interface = network("/sys/net/enx1", "/sys/camera-a", "enx1");
+        let mut output = MockCameraOutput::default();
 
-        assert!(matches!(
-            lifecycle
-                .apply(Observation::UsbUpsert {
-                    camera: first.clone(),
-                    source: EventSource::Udev,
-                })
-                .as_slice(),
-            [LifecycleEvent::CameraConnected { .. }]
-        ));
+        let detected = lifecycle.apply(Observation::UsbUpsert {
+            camera: first,
+            source: EventSource::Udev,
+        });
         assert_eq!(
-            lifecycle.apply(Observation::NetworkUpsert(interface.clone())),
-            vec![LifecycleEvent::NetworkReady(interface.clone())]
+            transition_kinds(&detected),
+            vec![
+                (
+                    CameraStateKind::Disconnected,
+                    CameraStateKind::DeviceDetected
+                ),
+                (
+                    CameraStateKind::DeviceDetected,
+                    CameraStateKind::WaitingForNetwork
+                ),
+            ]
         );
+        dispatch_all(detected, &mut output).unwrap();
+        assert_eq!(output.starts, 1);
+        assert_eq!(lifecycle.state.kind(), CameraStateKind::WaitingForNetwork);
+
+        let ready = lifecycle.apply(Observation::NetworkUpsert(interface));
         assert_eq!(
-            lifecycle.apply(Observation::NetworkRemoved {
-                sysfs_path: interface.sysfs_path.clone(),
-                name: Some(interface.name.clone()),
-                ifindex: interface.ifindex,
-                usb_path: Some(first.usb_path.clone()),
-            }),
-            vec![LifecycleEvent::NetworkDetached(interface)]
+            transition_kinds(&ready),
+            vec![
+                (CameraStateKind::WaitingForNetwork, CameraStateKind::Ready),
+                (CameraStateKind::Ready, CameraStateKind::Streaming),
+            ]
         );
-        assert_eq!(
-            lifecycle.apply(Observation::UsbRemoved {
-                usb_path: first.usb_path.clone(),
-            }),
-            vec![LifecycleEvent::CameraDisconnected(first.clone())]
-        );
-        assert!(matches!(
-            lifecycle
-                .apply(Observation::UsbUpsert {
-                    camera: first,
-                    source: EventSource::Udev,
-                })
-                .as_slice(),
-            [LifecycleEvent::CameraConnected { .. }]
-        ));
+        dispatch_all(ready, &mut output).unwrap();
+        assert_eq!(output.starts, 1);
+        assert_eq!(output.stops, 0);
+        assert_eq!(lifecycle.state.kind(), CameraStateKind::Streaming);
     }
 
     /// Verifies repeated udev observations do not emit duplicate transitions.
@@ -933,28 +1107,79 @@ mod tests {
         );
     }
 
-    /// Verifies removing USB directly also clears its cached network interface.
+    /// Verifies USB removal tears down every long-lived connected state.
     #[test]
-    fn physical_removal_detaches_network_and_camera() {
-        let mut lifecycle = Lifecycle::default();
+    fn usb_removal_reaches_disconnected_from_every_connected_state() {
         let identity = camera("/sys/camera-a", Some("C123"));
         let interface = network("/sys/net/enx1", "/sys/camera-a", "enx1");
+        let states = [
+            CameraState::DeviceDetected {
+                camera: identity.clone(),
+            },
+            CameraState::WaitingForNetwork {
+                camera: identity.clone(),
+            },
+            CameraState::Ready {
+                camera: identity.clone(),
+                network: interface.clone(),
+            },
+            CameraState::Streaming {
+                camera: identity.clone(),
+                network: interface.clone(),
+            },
+        ];
 
-        lifecycle.apply(Observation::UsbUpsert {
-            camera: identity.clone(),
-            source: EventSource::Startup,
-        });
-        lifecycle.apply(Observation::NetworkUpsert(interface.clone()));
-
-        assert_eq!(
-            lifecycle.apply(Observation::UsbRemoved {
+        for state in states {
+            let from = state.kind();
+            let mut lifecycle = Lifecycle {
+                state,
+                ignored: HashSet::new(),
+            };
+            let events = lifecycle.apply(Observation::UsbRemoved {
                 usb_path: identity.usb_path.clone(),
-            }),
-            vec![
-                LifecycleEvent::NetworkDetached(interface),
-                LifecycleEvent::CameraDisconnected(identity),
-            ]
-        );
+            });
+            assert_eq!(
+                transition_kinds(&events),
+                vec![(from, CameraStateKind::Disconnected)]
+            );
+            assert_eq!(lifecycle.state.kind(), CameraStateKind::Disconnected);
+        }
+    }
+
+    /// Verifies loss of the selected interface ends either post-network phase.
+    #[test]
+    fn network_removal_reaches_disconnected_from_ready_and_streaming() {
+        let identity = camera("/sys/camera-a", Some("C123"));
+        let interface = network("/sys/net/enx1", "/sys/camera-a", "enx1");
+        let states = [
+            CameraState::Ready {
+                camera: identity.clone(),
+                network: interface.clone(),
+            },
+            CameraState::Streaming {
+                camera: identity.clone(),
+                network: interface.clone(),
+            },
+        ];
+
+        for state in states {
+            let from = state.kind();
+            let mut lifecycle = Lifecycle {
+                state,
+                ignored: HashSet::new(),
+            };
+            let events = lifecycle.apply(Observation::NetworkRemoved {
+                sysfs_path: interface.sysfs_path.clone(),
+                name: Some(interface.name.clone()),
+                ifindex: interface.ifindex,
+                usb_path: Some(identity.usb_path.clone()),
+            });
+            assert_eq!(
+                transition_kinds(&events),
+                vec![(from, CameraStateKind::Disconnected)]
+            );
+            assert_eq!(lifecycle.state.kind(), CameraStateKind::Disconnected);
+        }
     }
 
     /// Verifies interfaces owned by other devices do not affect camera state.
@@ -975,7 +1200,7 @@ mod tests {
                 )))
                 .is_empty()
         );
-        assert!(lifecycle.active.as_ref().unwrap().network.is_none());
+        assert!(lifecycle.selected_network().is_none());
     }
 
     /// Verifies an early network observation does not prevent later attachment.
@@ -995,8 +1220,11 @@ mod tests {
             source: EventSource::Udev,
         });
         assert_eq!(
-            lifecycle.apply(Observation::NetworkUpsert(interface.clone())),
-            vec![LifecycleEvent::NetworkReady(interface)]
+            transition_kinds(&lifecycle.apply(Observation::NetworkUpsert(interface))),
+            vec![
+                (CameraStateKind::WaitingForNetwork, CameraStateKind::Ready),
+                (CameraStateKind::Ready, CameraStateKind::Streaming),
+            ]
         );
     }
 
@@ -1030,18 +1258,22 @@ mod tests {
         lifecycle.apply(Observation::UsbRemoved {
             usb_path: first.usb_path,
         });
-        assert!(matches!(
-            lifecycle
-                .apply(Observation::UsbUpsert {
-                    camera: second,
-                    source: EventSource::Reconcile,
-                })
-                .as_slice(),
-            [LifecycleEvent::CameraConnected {
+        assert_eq!(
+            transition_kinds(&lifecycle.apply(Observation::UsbUpsert {
+                camera: second,
                 source: EventSource::Reconcile,
-                ..
-            }]
-        ));
+            })),
+            vec![
+                (
+                    CameraStateKind::Disconnected,
+                    CameraStateKind::DeviceDetected
+                ),
+                (
+                    CameraStateKind::DeviceDetected,
+                    CameraStateKind::WaitingForNetwork
+                ),
+            ]
+        );
     }
 
     /// Verifies absent optional USB metadata is valid lifecycle input.
@@ -1050,15 +1282,97 @@ mod tests {
         let identity = CameraIdentity::unknown(PathBuf::from("/sys/camera-a"));
         let mut lifecycle = Lifecycle::default();
 
-        assert!(matches!(
-            lifecycle
-                .apply(Observation::UsbUpsert {
-                    camera: identity,
-                    source: EventSource::Startup,
-                })
-                .as_slice(),
-            [LifecycleEvent::CameraConnected { .. }]
-        ));
+        assert_eq!(
+            transition_kinds(&lifecycle.apply(Observation::UsbUpsert {
+                camera: identity,
+                source: EventSource::Startup,
+            })),
+            vec![
+                (
+                    CameraStateKind::Disconnected,
+                    CameraStateKind::DeviceDetected
+                ),
+                (
+                    CameraStateKind::DeviceDetected,
+                    CameraStateKind::WaitingForNetwork
+                ),
+            ]
+        );
+    }
+
+    /// Verifies loss of the selected USB network tears down the session and a
+    /// later USB/network observation creates a fresh black-frame session.
+    #[test]
+    fn network_loss_disconnects_and_network_reappearance_reconnects() {
+        let identity = camera("/sys/camera-a", Some("C123"));
+        let interface = network("/sys/net/enx1", "/sys/camera-a", "enx1");
+        let mut lifecycle = Lifecycle::default();
+        let mut output = MockCameraOutput::default();
+
+        dispatch_all(
+            lifecycle.apply(Observation::UsbUpsert {
+                camera: identity.clone(),
+                source: EventSource::Startup,
+            }),
+            &mut output,
+        )
+        .unwrap();
+        dispatch_all(
+            lifecycle.apply(Observation::NetworkUpsert(interface.clone())),
+            &mut output,
+        )
+        .unwrap();
+
+        let disconnected = lifecycle.apply(Observation::NetworkRemoved {
+            sysfs_path: interface.sysfs_path.clone(),
+            name: Some(interface.name.clone()),
+            ifindex: interface.ifindex,
+            usb_path: Some(identity.usb_path.clone()),
+        });
+        assert_eq!(
+            transition_kinds(&disconnected),
+            vec![(CameraStateKind::Streaming, CameraStateKind::Disconnected)]
+        );
+        dispatch_all(disconnected, &mut output).unwrap();
+        assert_eq!((output.starts, output.stops), (1, 1));
+
+        dispatch_all(
+            lifecycle.apply(Observation::UsbUpsert {
+                camera: identity,
+                source: EventSource::Udev,
+            }),
+            &mut output,
+        )
+        .unwrap();
+        dispatch_all(
+            lifecycle.apply(Observation::NetworkUpsert(interface)),
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!((output.starts, output.stops), (2, 1));
+        assert_eq!(lifecycle.state.kind(), CameraStateKind::Streaming);
+    }
+
+    /// Verifies a daemon restart reconciles an already-connected GoPro into
+    /// streaming state without waiting for a future udev event.
+    #[test]
+    fn startup_inventory_with_camera_and_network_reaches_streaming() {
+        let identity = camera("/sys/camera-a", Some("C123"));
+        let interface = network("/sys/net/enx1", "/sys/camera-a", "enx1");
+        let mut lifecycle = Lifecycle::default();
+        let mut output = MockCameraOutput::default();
+
+        reconcile_inventory(
+            &mut lifecycle,
+            EventSource::Startup,
+            vec![identity],
+            vec![interface],
+            &mut output,
+        )
+        .unwrap();
+
+        assert_eq!(lifecycle.state.kind(), CameraStateKind::Streaming);
+        assert_eq!((output.starts, output.stops), (1, 0));
     }
 
     /// Verifies the USB identifier parser accepts kernel and prefixed forms.
