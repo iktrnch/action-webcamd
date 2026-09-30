@@ -21,22 +21,24 @@ use super::{lifecycle::*, model::*};
 use crate::{
     gopro::{GoProClient, WebcamConfiguration},
     network::AddressMonitor,
-    stream::{StreamMonitor, StreamSocket},
-    virtual_camera::{CameraOutput, VirtualCamera},
+    stream::{PreparedStream, StreamFailure, StreamMonitor, StreamSocket},
+    virtual_camera::{CameraOutput, FrameSink, VirtualCamera},
 };
 
 type WebcamStartFuture = Pin<Box<dyn Future<Output = WebcamStartResult>>>;
 
 struct ActiveWebcam {
+    session_id: u64,
     endpoint: ControlEndpoint,
     client: GoProClient,
     stream: StreamMonitor,
 }
 
 struct WebcamStartResult {
+    session_id: u64,
     endpoint: ControlEndpoint,
     client: Option<GoProClient>,
-    stream: Option<StreamSocket>,
+    stream: Option<PreparedStream>,
     outcome: WebcamStartOutcome,
 }
 
@@ -57,6 +59,9 @@ pub(crate) async fn run(
     let mut api_probe = None;
     let mut webcam_start = None;
     let mut active_webcam = None;
+    let frame_sink = virtual_camera.frame_sink();
+    let (stream_failure_sender, mut stream_failures) = tokio::sync::mpsc::unbounded_channel();
+    let mut next_session_id = 1_u64;
 
     reconcile(
         &mut lifecycle,
@@ -66,6 +71,8 @@ pub(crate) async fn run(
         &mut api_probe,
         &mut webcam_start,
         &mut active_webcam,
+        &frame_sink,
+        &mut next_session_id,
     )
     .await
     .context("failed to enumerate devices during startup")?;
@@ -90,22 +97,26 @@ pub(crate) async fn run(
                 virtual_camera.stop().context("failed to stop failed virtual camera producer")?;
                 return Err(error);
             }
+            failure = stream_failures.recv() => {
+                let failure = failure.expect("stream failure sender remains owned by runtime");
+                handle_stream_failure(&mut active_webcam, failure).await;
+            }
             item = usb_monitor.next() => {
                 match item {
-                    Some(Ok(event)) => handle_usb_event(&mut lifecycle, &event, &mut virtual_camera, &address_monitor, &mut api_probe, &mut webcam_start, &mut active_webcam).await?,
+                    Some(Ok(event)) => handle_usb_event(&mut lifecycle, &event, &mut virtual_camera, &address_monitor, &mut api_probe, &mut webcam_start, &mut active_webcam, &frame_sink, &mut next_session_id).await?,
                     Some(Err(error)) => {
                         warn!(%error, event = "udev_receive_error", subsystem = "usb", "failed to receive USB udev event; reconciling");
-                        reconcile(&mut lifecycle, EventSource::Reconcile, &mut virtual_camera, &address_monitor, &mut api_probe, &mut webcam_start, &mut active_webcam).await?;
+                        reconcile(&mut lifecycle, EventSource::Reconcile, &mut virtual_camera, &address_monitor, &mut api_probe, &mut webcam_start, &mut active_webcam, &frame_sink, &mut next_session_id).await?;
                     }
                     None => bail!("USB udev monitor ended unexpectedly"),
                 }
             }
             item = network_monitor.next() => {
                 match item {
-                    Some(Ok(event)) => handle_network_event(&mut lifecycle, &event, &mut virtual_camera, &address_monitor, &mut api_probe, &mut webcam_start, &mut active_webcam).await?,
+                    Some(Ok(event)) => handle_network_event(&mut lifecycle, &event, &mut virtual_camera, &address_monitor, &mut api_probe, &mut webcam_start, &mut active_webcam, &frame_sink, &mut next_session_id).await?,
                     Some(Err(error)) => {
                         warn!(%error, event = "udev_receive_error", subsystem = "net", "failed to receive network udev event; reconciling");
-                        reconcile(&mut lifecycle, EventSource::Reconcile, &mut virtual_camera, &address_monitor, &mut api_probe, &mut webcam_start, &mut active_webcam).await?;
+                        reconcile(&mut lifecycle, EventSource::Reconcile, &mut virtual_camera, &address_monitor, &mut api_probe, &mut webcam_start, &mut active_webcam, &frame_sink, &mut next_session_id).await?;
                     }
                     None => bail!("network udev monitor ended unexpectedly"),
                 }
@@ -114,7 +125,7 @@ pub(crate) async fn run(
                 let change = change?;
                 if lifecycle.selected_network().is_some_and(|network| network.ifindex == change.ifindex) {
                     debug!(event = "gopro_ipv4_address_changed", ifindex = change.ifindex, address = %change.address, "refreshing GoPro USB-network addresses");
-                    refresh_selected_addresses(&mut lifecycle, &mut virtual_camera, &address_monitor, &mut api_probe, &mut webcam_start, &mut active_webcam).await?;
+                    refresh_selected_addresses(&mut lifecycle, &mut virtual_camera, &address_monitor, &mut api_probe, &mut webcam_start, &mut active_webcam, &frame_sink, &mut next_session_id).await?;
                 }
             }
             result = next_api_probe(&mut api_probe) => {
@@ -124,11 +135,11 @@ pub(crate) async fn run(
                     Err(error) => Observation::ApiProbeFailed { ifindex: result.ifindex, endpoint: result.endpoint, error },
                 };
                 let events = lifecycle.apply(observation);
-                dispatch_runtime(&lifecycle, events, &mut virtual_camera, &mut api_probe, &mut webcam_start, &mut active_webcam).await?;
+                dispatch_runtime(&lifecycle, events, &mut virtual_camera, &mut api_probe, &mut webcam_start, &mut active_webcam, &frame_sink, &mut next_session_id).await?;
             }
             result = next_webcam_start(&mut webcam_start) => {
                 webcam_start = None;
-                apply_webcam_start_result(&lifecycle, result, &mut active_webcam).await;
+                apply_webcam_start_result(&lifecycle, result, &mut active_webcam, stream_failure_sender.clone()).await;
             }
         }
     }
@@ -150,6 +161,7 @@ fn monitor_network() -> Result<AsyncMonitorSocket> {
 
 /// Converts one USB udev event into a lifecycle observation and reconciles
 /// remaining cameras after the active camera disconnects.
+#[allow(clippy::too_many_arguments)] // Runtime resources intentionally remain independently owned by the select loop.
 async fn handle_usb_event(
     lifecycle: &mut Lifecycle,
     event: &Event,
@@ -158,6 +170,8 @@ async fn handle_usb_event(
     api_probe: &mut Option<ApiProbeFuture>,
     webcam_start: &mut Option<WebcamStartFuture>,
     active_webcam: &mut Option<ActiveWebcam>,
+    frame_sink: &FrameSink,
+    next_session_id: &mut u64,
 ) -> Result<()> {
     let usb_path = event.syspath().to_path_buf();
     let observation = match event.event_type() {
@@ -186,6 +200,8 @@ async fn handle_usb_event(
         api_probe,
         webcam_start,
         active_webcam,
+        frame_sink,
+        next_session_id,
     )
     .await?;
 
@@ -198,6 +214,8 @@ async fn handle_usb_event(
             api_probe,
             webcam_start,
             active_webcam,
+            frame_sink,
+            next_session_id,
         )
         .await?;
     }
@@ -207,6 +225,7 @@ async fn handle_usb_event(
 
 /// Converts one network udev event into lifecycle observations, ensuring the
 /// owning USB camera is observed before its interface.
+#[allow(clippy::too_many_arguments)] // Runtime resources intentionally remain independently owned by the select loop.
 async fn handle_network_event(
     lifecycle: &mut Lifecycle,
     event: &Event,
@@ -215,6 +234,8 @@ async fn handle_network_event(
     api_probe: &mut Option<ApiProbeFuture>,
     webcam_start: &mut Option<WebcamStartFuture>,
     active_webcam: &mut Option<ActiveWebcam>,
+    frame_sink: &FrameSink,
+    next_session_id: &mut u64,
 ) -> Result<()> {
     let event_type = event.event_type();
     if matches!(
@@ -243,6 +264,8 @@ async fn handle_network_event(
                 api_probe,
                 webcam_start,
                 active_webcam,
+                frame_sink,
+                next_session_id,
             )
             .await?;
         }
@@ -254,6 +277,8 @@ async fn handle_network_event(
             api_probe,
             webcam_start,
             active_webcam,
+            frame_sink,
+            next_session_id,
         )
         .await?;
         refresh_selected_addresses(
@@ -263,6 +288,8 @@ async fn handle_network_event(
             api_probe,
             webcam_start,
             active_webcam,
+            frame_sink,
+            next_session_id,
         )
         .await?;
         return Ok(());
@@ -290,6 +317,8 @@ async fn handle_network_event(
             api_probe,
             webcam_start,
             active_webcam,
+            frame_sink,
+            next_session_id,
         )
         .await?;
         return Ok(());
@@ -302,6 +331,7 @@ async fn handle_network_event(
 
 /// Rebuilds lifecycle state from the current sysfs inventory to cover startup,
 /// missed events, and promotion of an already-connected secondary camera.
+#[allow(clippy::too_many_arguments)] // Runtime resources intentionally remain independently owned by the select loop.
 async fn reconcile(
     lifecycle: &mut Lifecycle,
     source: EventSource,
@@ -310,6 +340,8 @@ async fn reconcile(
     api_probe: &mut Option<ApiProbeFuture>,
     webcam_start: &mut Option<WebcamStartFuture>,
     active_webcam: &mut Option<ActiveWebcam>,
+    frame_sink: &FrameSink,
+    next_session_id: &mut u64,
 ) -> Result<()> {
     let cameras = enumerate_usb_cameras()?;
     let networks = enumerate_gopro_networks()?;
@@ -328,12 +360,15 @@ async fn reconcile(
         api_probe,
         webcam_start,
         active_webcam,
+        frame_sink,
+        next_session_id,
     )
     .await
 }
 
 /// Reconciles the selected interface's address inventory after udev discovery
 /// or an IPv4 netlink notification. This replaces timing-dependent sleeps.
+#[allow(clippy::too_many_arguments)] // Runtime resources intentionally remain independently owned by the select loop.
 async fn refresh_selected_addresses(
     lifecycle: &mut Lifecycle,
     virtual_camera: &mut VirtualCamera,
@@ -341,6 +376,8 @@ async fn refresh_selected_addresses(
     api_probe: &mut Option<ApiProbeFuture>,
     webcam_start: &mut Option<WebcamStartFuture>,
     active_webcam: &mut Option<ActiveWebcam>,
+    frame_sink: &FrameSink,
+    next_session_id: &mut u64,
 ) -> Result<()> {
     let Some(network) = lifecycle.selected_network() else {
         return Ok(());
@@ -355,12 +392,15 @@ async fn refresh_selected_addresses(
         api_probe,
         webcam_start,
         active_webcam,
+        frame_sink,
+        next_session_id,
     )
     .await
 }
 
 /// Dispatches state effects and keeps the single in-flight TCP probe aligned
 /// with lifecycle state. Dropping the future cancels a stale connect attempt.
+#[allow(clippy::too_many_arguments)] // Runtime resources intentionally remain independently owned by the select loop.
 async fn dispatch_runtime(
     lifecycle: &Lifecycle,
     events: Vec<LifecycleEvent>,
@@ -368,6 +408,8 @@ async fn dispatch_runtime(
     api_probe: &mut Option<ApiProbeFuture>,
     webcam_start: &mut Option<WebcamStartFuture>,
     active_webcam: &mut Option<ActiveWebcam>,
+    frame_sink: &FrameSink,
+    next_session_id: &mut u64,
 ) -> Result<()> {
     let api_request = api_probe_request(&events);
     let webcam_request = webcam_start_request(&events);
@@ -387,7 +429,13 @@ async fn dispatch_runtime(
     }
     if let Some(endpoint) = webcam_request {
         discard_active_webcam(active_webcam).await;
-        *webcam_start = Some(Box::pin(start_webcam_mode(endpoint)));
+        let session_id = *next_session_id;
+        *next_session_id = next_session_id.wrapping_add(1).max(1);
+        *webcam_start = Some(Box::pin(start_webcam_mode(
+            endpoint,
+            frame_sink.clone(),
+            session_id,
+        )));
     }
 
     if let Some((ifindex, endpoint)) = api_request {
@@ -412,11 +460,16 @@ pub(super) fn webcam_start_request(events: &[LifecycleEvent]) -> Option<ControlE
 
 /// Runs the ordered START then FOV configuration without blocking hotplug
 /// monitoring. Dropping this future cancels it when the session goes stale.
-async fn start_webcam_mode(endpoint: ControlEndpoint) -> WebcamStartResult {
+async fn start_webcam_mode(
+    endpoint: ControlEndpoint,
+    frame_sink: FrameSink,
+    session_id: u64,
+) -> WebcamStartResult {
     let client = match GoProClient::new(endpoint.host_address, endpoint.control_address) {
         Ok(client) => client,
         Err(error) => {
             return WebcamStartResult {
+                session_id,
                 endpoint,
                 client: None,
                 stream: None,
@@ -430,6 +483,20 @@ async fn start_webcam_mode(endpoint: ControlEndpoint) -> WebcamStartResult {
         Ok(stream) => stream,
         Err(error) => {
             return WebcamStartResult {
+                session_id,
+                endpoint,
+                client: Some(client),
+                stream: None,
+                outcome: WebcamStartOutcome::StartFailed(error.to_string()),
+            };
+        }
+    };
+
+    let stream = match stream.prepare_decoder(frame_sink, session_id) {
+        Ok(stream) => stream,
+        Err(error) => {
+            return WebcamStartResult {
+                session_id,
                 endpoint,
                 client: Some(client),
                 stream: None,
@@ -440,6 +507,7 @@ async fn start_webcam_mode(endpoint: ControlEndpoint) -> WebcamStartResult {
 
     if let Err(error) = client.start_webcam(configuration).await {
         return WebcamStartResult {
+            session_id,
             endpoint,
             client: Some(client),
             stream: Some(stream),
@@ -448,6 +516,7 @@ async fn start_webcam_mode(endpoint: ControlEndpoint) -> WebcamStartResult {
     }
     if let Err(error) = client.set_webcam_fov(configuration.fov()).await {
         return WebcamStartResult {
+            session_id,
             endpoint,
             client: Some(client),
             stream: Some(stream),
@@ -456,6 +525,7 @@ async fn start_webcam_mode(endpoint: ControlEndpoint) -> WebcamStartResult {
     }
 
     WebcamStartResult {
+        session_id,
         endpoint,
         client: Some(client),
         stream: Some(stream),
@@ -468,6 +538,7 @@ async fn apply_webcam_start_result(
     lifecycle: &Lifecycle,
     result: WebcamStartResult,
     active_webcam: &mut Option<ActiveWebcam>,
+    stream_failures: tokio::sync::mpsc::UnboundedSender<StreamFailure>,
 ) {
     if lifecycle.state.kind() != CameraStateKind::Ready
         || lifecycle.state.endpoint() != Some(result.endpoint)
@@ -488,11 +559,19 @@ async fn apply_webcam_start_result(
             let stream = result
                 .stream
                 .expect("successful webcam start retains its UDP receiver");
+            let stream = match stream.monitor(stream_failures.clone()) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    warn!(event = "gopro_stream_start_failed", control_address = %result.endpoint.control_address, %error, "FFmpeg decoder could not begin stream monitoring");
+                    return;
+                }
+            };
             discard_active_webcam(active_webcam).await;
             *active_webcam = Some(ActiveWebcam {
+                session_id: result.session_id,
                 endpoint: result.endpoint,
                 client,
-                stream: stream.monitor(),
+                stream,
             });
             info!(
                 event = "gopro_webcam_started",
@@ -518,12 +597,20 @@ async fn apply_webcam_start_result(
                 let stream = result
                     .stream
                     .expect("started webcam retains its UDP receiver after an FOV failure");
-                discard_active_webcam(active_webcam).await;
-                *active_webcam = Some(ActiveWebcam {
-                    endpoint: result.endpoint,
-                    client,
-                    stream: stream.monitor(),
-                });
+                match stream.monitor(stream_failures.clone()) {
+                    Ok(stream) => {
+                        discard_active_webcam(active_webcam).await;
+                        *active_webcam = Some(ActiveWebcam {
+                            session_id: result.session_id,
+                            endpoint: result.endpoint,
+                            client,
+                            stream,
+                        });
+                    }
+                    Err(monitor_error) => {
+                        warn!(event = "gopro_stream_start_failed", control_address = %result.endpoint.control_address, %monitor_error, "FFmpeg decoder could not begin stream monitoring")
+                    }
+                }
             }
             warn!(
                 event = "gopro_webcam_fov_failed",
@@ -575,6 +662,31 @@ async fn discard_active_webcam(active_webcam: &mut Option<ActiveWebcam>) {
     if let Some(active) = active_webcam.take() {
         active.stream.stop().await;
     }
+}
+
+/// Ends only the matching failed decoder session. The GoPro is deliberately
+/// left alone here: a genuine network or device transition owns retrying it.
+async fn handle_stream_failure(active_webcam: &mut Option<ActiveWebcam>, failure: StreamFailure) {
+    let Some(active) = active_webcam.as_ref() else {
+        debug!(event = "gopro_stream_failure_stale", session_id = failure.session_id, %failure.error, "ignoring stream failure without an active session");
+        return;
+    };
+    if !stream_failure_matches(Some(active.session_id), failure.session_id) {
+        debug!(event = "gopro_stream_failure_stale", session_id = failure.session_id, active_session_id = active.session_id, %failure.error, "ignoring stale stream failure");
+        return;
+    }
+    warn!(
+        event = "gopro_stream_decoder_failed",
+        session_id = failure.session_id,
+        control_address = %active.endpoint.control_address,
+        %failure.error,
+        "GoPro stream session failed; retaining black frames until a lifecycle reconnect"
+    );
+    discard_active_webcam(active_webcam).await;
+}
+
+fn stream_failure_matches(active_session_id: Option<u64>, failure_session_id: u64) -> bool {
+    active_session_id == Some(failure_session_id)
 }
 
 /// Extracts a newly requested probe from the transition that introduced its
@@ -884,5 +996,17 @@ async fn shutdown_signal() -> Result<()> {
     tokio::select! {
         result = tokio::signal::ctrl_c() => result.context("failed to register Ctrl-C handler"),
         _ = terminate.recv() => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+
+    #[test]
+    fn stream_failures_only_match_the_active_session_generation() {
+        assert!(stream_failure_matches(Some(7), 7));
+        assert!(!stream_failure_matches(Some(7), 8));
+        assert!(!stream_failure_matches(None, 7));
     }
 }

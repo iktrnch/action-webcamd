@@ -2,7 +2,10 @@ use std::{
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError},
+    sync::{
+        Arc, Mutex,
+        mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError},
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -22,6 +25,39 @@ const YUV420_FOURCC_BYTES: &[u8; 4] = b"YU12";
 const Y_BLACK: u8 = 16;
 const UV_NEUTRAL: u8 = 128;
 
+/// A bounded, latest-frame-wins handoff from the decoder to the V4L2 writer.
+///
+/// The output device has one fixed frame cadence. Retaining only the newest
+/// decoded frame prevents an overloaded consumer from increasing video latency.
+#[derive(Clone, Default)]
+pub(crate) struct FrameSink {
+    latest: Arc<Mutex<Option<Vec<u8>>>>,
+}
+
+impl FrameSink {
+    /// Replaces any unconsumed frame with one complete YU12 frame.
+    pub(crate) fn publish(&self, frame: Vec<u8>) -> Result<()> {
+        ensure!(
+            frame.len() == frame_size(VIDEO_WIDTH, VIDEO_HEIGHT)?,
+            "decoded frame has {} bytes; expected {} bytes for {}x{} YU12",
+            frame.len(),
+            frame_size(VIDEO_WIDTH, VIDEO_HEIGHT)?,
+            VIDEO_WIDTH,
+            VIDEO_HEIGHT,
+        );
+        *self.latest.lock().expect("frame sink lock poisoned") = Some(frame);
+        Ok(())
+    }
+
+    pub(crate) fn take(&self) -> Option<Vec<u8>> {
+        self.latest.lock().expect("frame sink lock poisoned").take()
+    }
+
+    pub(crate) fn clear(&self) {
+        *self.latest.lock().expect("frame sink lock poisoned") = None;
+    }
+}
+
 /// Receives physical-camera presence changes from the hotplug reducer.
 pub(crate) trait CameraOutput {
     /// Starts producing placeholder frames for the active camera.
@@ -35,6 +71,7 @@ pub(crate) trait CameraOutput {
 pub(crate) struct VirtualCamera {
     device_path: PathBuf,
     producer: Option<Producer>,
+    frames: FrameSink,
     failures: UnboundedSender<anyhow::Error>,
 }
 
@@ -59,6 +96,7 @@ impl VirtualCamera {
             Self {
                 device_path,
                 producer: None,
+                frames: FrameSink::default(),
                 failures,
             },
             receiver,
@@ -70,6 +108,11 @@ impl VirtualCamera {
     fn device_path(&self) -> &Path {
         &self.device_path
     }
+
+    /// Returns the stable frame handoff used by each active decoder session.
+    pub(crate) fn frame_sink(&self) -> FrameSink {
+        self.frames.clone()
+    }
 }
 
 impl CameraOutput for VirtualCamera {
@@ -79,7 +122,12 @@ impl CameraOutput for VirtualCamera {
         }
 
         let device = configure_output(&self.device_path)?;
-        let producer = Producer::spawn(device, self.device_path.clone(), self.failures.clone())?;
+        let producer = Producer::spawn(
+            device,
+            self.device_path.clone(),
+            self.failures.clone(),
+            self.frames.clone(),
+        )?;
         self.producer = Some(producer);
 
         info!(
@@ -99,6 +147,7 @@ impl CameraOutput for VirtualCamera {
             return Ok(());
         };
 
+        self.frames.clear();
         producer.stop()?;
         info!(
             event = "virtual_camera_feed_stopped",
@@ -129,12 +178,13 @@ impl Producer {
         device: Device,
         device_path: PathBuf,
         failures: UnboundedSender<anyhow::Error>,
+        frames: FrameSink,
     ) -> Result<Self> {
         let (stop, receiver) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("gopro-black-frame-producer".to_owned())
             .spawn(move || {
-                if let Err(error) = produce_frames(device, receiver) {
+                if let Err(error) = produce_frames(device, receiver, frames) {
                     let _ = failures.send(error.context(format!(
                         "virtual camera producer failed for {}",
                         device_path.display()
@@ -299,7 +349,7 @@ fn configure_output(path: &Path) -> Result<Device> {
 }
 
 /// Writes black frames at fixed monotonic deadlines until cancellation.
-fn produce_frames(mut device: Device, stop: Receiver<()>) -> Result<()> {
+fn produce_frames(mut device: Device, stop: Receiver<()>, frames: FrameSink) -> Result<()> {
     let frame = black_yuv420_frame(VIDEO_WIDTH, VIDEO_HEIGHT)?;
     let interval = Duration::from_nanos(1_000_000_000 / u64::from(VIDEO_FPS));
     let mut deadline = Instant::now();
@@ -310,7 +360,11 @@ fn produce_frames(mut device: Device, stop: Receiver<()>) -> Result<()> {
             Err(TryRecvError::Empty) => {}
         }
 
-        write_frame(&mut device, &frame).context("failed to write black YUV frame")?;
+        if let Some(decoded) = frames.take() {
+            write_frame(&mut device, &decoded).context("failed to write decoded YUV frame")?;
+        } else {
+            write_frame(&mut device, &frame).context("failed to write black YUV frame")?;
+        }
 
         deadline += interval;
         let now = Instant::now();
@@ -354,6 +408,15 @@ fn black_yuv420_frame(width: u32, height: u32) -> Result<Vec<u8>> {
     let mut frame = vec![Y_BLACK; pixels];
     frame.resize(pixels + chroma_samples * 2, UV_NEUTRAL);
     Ok(frame)
+}
+
+fn frame_size(width: u32, height: u32) -> Result<usize> {
+    ensure!(
+        width > 0 && height > 0 && width.is_multiple_of(2) && height.is_multiple_of(2),
+        "YUV420 dimensions must be non-zero and even"
+    );
+    usize::try_from(u64::from(width) * u64::from(height) * 3 / 2)
+        .context("video dimensions do not fit in memory")
 }
 
 #[cfg(test)]
@@ -508,11 +571,26 @@ mod tests {
     }
 
     #[test]
+    fn frame_sink_retains_only_the_newest_complete_frame() {
+        let sink = FrameSink::default();
+        let first = vec![1; frame_size(VIDEO_WIDTH, VIDEO_HEIGHT).unwrap()];
+        let latest = vec![2; frame_size(VIDEO_WIDTH, VIDEO_HEIGHT).unwrap()];
+
+        sink.publish(first).unwrap();
+        sink.publish(latest.clone()).unwrap();
+
+        assert_eq!(sink.take(), Some(latest));
+        assert_eq!(sink.take(), None);
+        assert!(sink.publish(vec![0; 1]).is_err());
+    }
+
+    #[test]
     fn test_virtual_camera_retains_selected_path() {
         let (failures, _receiver) = unbounded_channel();
         let camera = VirtualCamera {
             device_path: PathBuf::from("/dev/video42"),
             producer: None,
+            frames: FrameSink::default(),
             failures,
         };
 
