@@ -35,7 +35,7 @@ use crate::{
 const STREAM_STATISTICS_INTERVAL: Duration = Duration::from_secs(1);
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_UDP_DATAGRAM_SIZE: usize = 65_535;
-const DECODER_PACKET_QUEUE: usize = 256;
+const DECODER_PACKET_QUEUE: usize = 64;
 const DECODER_DIAGNOSTIC_LINES: usize = 20;
 
 /// A failure that ends one active stream session without ending the daemon.
@@ -106,6 +106,7 @@ pub(crate) struct PreparedStream {
 impl PreparedStream {
     pub(crate) fn monitor(self, failures: UnboundedSender<StreamFailure>) -> Result<StreamMonitor> {
         let stopping = self.decoder.stopping.clone();
+        let frames = self.decoder.frame_sink();
         let decoder = self.decoder.activate(self.session_id, failures.clone())?;
         let task = tokio::spawn(receive(
             self.socket,
@@ -114,6 +115,7 @@ impl PreparedStream {
             self.session_id,
             failures,
             stopping,
+            frames,
         ));
         Ok(StreamMonitor {
             task: Some(task),
@@ -162,6 +164,7 @@ async fn receive(
     session_id: u64,
     failures: UnboundedSender<StreamFailure>,
     stopping: Arc<AtomicBool>,
+    frames: FrameSink,
 ) {
     let mut buffer = [0_u8; MAX_UDP_DATAGRAM_SIZE];
     let mut tracker = StreamTracker::default();
@@ -193,6 +196,7 @@ async fn receive(
             },
             _ = wait_for_idle_stream(tracker.last_packet()) => {
                 if let Some(totals) = tracker.stop_if_idle(Instant::now()) {
+                    frames.clear();
                     info!(event = "gopro_stream_stopped", address = %local_address, packets = totals.packets, bytes = totals.bytes, dropped_packets = totals.dropped_packets, idle_seconds = STREAM_IDLE_TIMEOUT.as_secs(), "GoPro UDP stream stopped after inactivity");
                 }
             },
@@ -297,6 +301,10 @@ impl FfmpegDecoder {
             .clone()
     }
 
+    fn frame_sink(&self) -> FrameSink {
+        self.frames.clone()
+    }
+
     fn activate(
         mut self,
         session_id: u64,
@@ -370,12 +378,22 @@ fn ffmpeg_command() -> Command {
             "-hide_banner",
             "-loglevel",
             "warning",
+            "-probesize",
+            "2048",
+            "-analyzeduration",
+            "0",
+            "-threads",
+            "1",
+            "-flags",
+            "low_delay",
             "-f",
             "mpegts",
             "-i",
             "pipe:0",
             "-map",
             "0:v:0",
+            "-fps_mode",
+            "passthrough",
             "-an",
             "-sn",
             "-dn",
@@ -619,6 +637,8 @@ mod tests {
     use super::*;
     use std::io;
 
+    use crate::virtual_camera::FrameUpdate;
+
     struct FragmentedReader {
         bytes: io::Cursor<Vec<u8>>,
         maximum_read: usize,
@@ -639,6 +659,25 @@ mod tests {
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert!(arguments.windows(2).any(|pair| pair == ["-i", "pipe:0"]));
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["-fps_mode", "passthrough"])
+        );
+        let input = arguments
+            .iter()
+            .position(|argument| argument == "-i")
+            .unwrap();
+        assert!(
+            arguments[..input]
+                .windows(2)
+                .any(|pair| pair == ["-threads", "1"])
+        );
+        assert!(
+            arguments[..input]
+                .windows(2)
+                .any(|pair| pair == ["-flags", "low_delay"])
+        );
         assert!(arguments.windows(2).any(|pair| pair == ["-f", "rawvideo"]));
         assert!(arguments.contains(&"yuv420p".to_owned()));
         assert!(
@@ -700,7 +739,7 @@ mod tests {
             errors.clone(),
         );
 
-        assert_eq!(sink.take(), Some(vec![2; frame_bytes]));
+        assert_eq!(sink.take(), FrameUpdate::New(vec![2; frame_bytes]));
         assert!(
             errors
                 .lock()

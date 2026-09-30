@@ -31,7 +31,21 @@ const UV_NEUTRAL: u8 = 128;
 /// decoded frame prevents an overloaded consumer from increasing video latency.
 #[derive(Clone, Default)]
 pub(crate) struct FrameSink {
-    latest: Arc<Mutex<Option<Vec<u8>>>>,
+    state: Arc<Mutex<FrameState>>,
+}
+
+#[derive(Default)]
+struct FrameState {
+    latest: Option<Vec<u8>>,
+    reset_requested: bool,
+}
+
+/// One update consumed by the V4L2 producer on its fixed frame cadence.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FrameUpdate {
+    New(Vec<u8>),
+    Reset,
+    Empty,
 }
 
 impl FrameSink {
@@ -45,16 +59,28 @@ impl FrameSink {
             VIDEO_WIDTH,
             VIDEO_HEIGHT,
         );
-        *self.latest.lock().expect("frame sink lock poisoned") = Some(frame);
+        let mut state = self.state.lock().expect("frame sink lock poisoned");
+        state.latest = Some(frame);
+        state.reset_requested = false;
         Ok(())
     }
 
-    pub(crate) fn take(&self) -> Option<Vec<u8>> {
-        self.latest.lock().expect("frame sink lock poisoned").take()
+    pub(crate) fn take(&self) -> FrameUpdate {
+        let mut state = self.state.lock().expect("frame sink lock poisoned");
+        if state.reset_requested {
+            state.reset_requested = false;
+            return FrameUpdate::Reset;
+        }
+        state
+            .latest
+            .take()
+            .map_or(FrameUpdate::Empty, FrameUpdate::New)
     }
 
     pub(crate) fn clear(&self) {
-        *self.latest.lock().expect("frame sink lock poisoned") = None;
+        let mut state = self.state.lock().expect("frame sink lock poisoned");
+        state.latest = None;
+        state.reset_requested = true;
     }
 }
 
@@ -350,7 +376,8 @@ fn configure_output(path: &Path) -> Result<Device> {
 
 /// Writes black frames at fixed monotonic deadlines until cancellation.
 fn produce_frames(mut device: Device, stop: Receiver<()>, frames: FrameSink) -> Result<()> {
-    let frame = black_yuv420_frame(VIDEO_WIDTH, VIDEO_HEIGHT)?;
+    let black_frame = black_yuv420_frame(VIDEO_WIDTH, VIDEO_HEIGHT)?;
+    let mut frame = black_frame.clone();
     let interval = Duration::from_nanos(1_000_000_000 / u64::from(VIDEO_FPS));
     let mut deadline = Instant::now();
 
@@ -360,11 +387,12 @@ fn produce_frames(mut device: Device, stop: Receiver<()>, frames: FrameSink) -> 
             Err(TryRecvError::Empty) => {}
         }
 
-        if let Some(decoded) = frames.take() {
-            write_frame(&mut device, &decoded).context("failed to write decoded YUV frame")?;
-        } else {
-            write_frame(&mut device, &frame).context("failed to write black YUV frame")?;
+        match frames.take() {
+            FrameUpdate::New(decoded) => frame = decoded,
+            FrameUpdate::Reset => frame.clone_from(&black_frame),
+            FrameUpdate::Empty => {}
         }
+        write_frame(&mut device, &frame).context("failed to write YUV frame")?;
 
         deadline += interval;
         let now = Instant::now();
@@ -579,8 +607,10 @@ mod tests {
         sink.publish(first).unwrap();
         sink.publish(latest.clone()).unwrap();
 
-        assert_eq!(sink.take(), Some(latest));
-        assert_eq!(sink.take(), None);
+        assert_eq!(sink.take(), FrameUpdate::New(latest));
+        assert_eq!(sink.take(), FrameUpdate::Empty);
+        sink.clear();
+        assert_eq!(sink.take(), FrameUpdate::Reset);
         assert!(sink.publish(vec![0; 1]).is_err());
     }
 
