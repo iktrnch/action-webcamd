@@ -2,6 +2,7 @@ mod gopro;
 mod hotplug;
 mod network;
 mod settings;
+mod stream;
 mod virtual_camera;
 
 use anyhow::Result;

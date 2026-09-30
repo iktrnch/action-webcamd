@@ -27,6 +27,10 @@ impl WebcamConfiguration {
     pub(crate) const fn fov(self) -> WebcamFov {
         self.fov
     }
+
+    pub(crate) const fn udp_port(self) -> u16 {
+        self.udp_port
+    }
 }
 
 /// GoPro's legacy webcam resolution values.

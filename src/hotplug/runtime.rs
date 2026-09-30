@@ -21,6 +21,7 @@ use super::{lifecycle::*, model::*};
 use crate::{
     gopro::{GoProClient, WebcamConfiguration},
     network::AddressMonitor,
+    stream::{StreamMonitor, StreamSocket},
     virtual_camera::{CameraOutput, VirtualCamera},
 };
 
@@ -29,11 +30,13 @@ type WebcamStartFuture = Pin<Box<dyn Future<Output = WebcamStartResult>>>;
 struct ActiveWebcam {
     endpoint: ControlEndpoint,
     client: GoProClient,
+    stream: StreamMonitor,
 }
 
 struct WebcamStartResult {
     endpoint: ControlEndpoint,
     client: Option<GoProClient>,
+    stream: Option<StreamSocket>,
     outcome: WebcamStartOutcome,
 }
 
@@ -121,11 +124,11 @@ pub(crate) async fn run(
                     Err(error) => Observation::ApiProbeFailed { ifindex: result.ifindex, endpoint: result.endpoint, error },
                 };
                 let events = lifecycle.apply(observation);
-                dispatch_runtime(&lifecycle, events, &mut virtual_camera, &mut api_probe, &mut webcam_start, &mut active_webcam)?;
+                dispatch_runtime(&lifecycle, events, &mut virtual_camera, &mut api_probe, &mut webcam_start, &mut active_webcam).await?;
             }
             result = next_webcam_start(&mut webcam_start) => {
                 webcam_start = None;
-                apply_webcam_start_result(&lifecycle, result, &mut active_webcam);
+                apply_webcam_start_result(&lifecycle, result, &mut active_webcam).await;
             }
         }
     }
@@ -183,7 +186,8 @@ async fn handle_usb_event(
         api_probe,
         webcam_start,
         active_webcam,
-    )?;
+    )
+    .await?;
 
     if active_was_removed && !lifecycle.has_active_camera() {
         reconcile(
@@ -239,7 +243,8 @@ async fn handle_network_event(
                 api_probe,
                 webcam_start,
                 active_webcam,
-            )?;
+            )
+            .await?;
         }
         let events = lifecycle.apply(Observation::NetworkUpsert(network));
         dispatch_runtime(
@@ -249,7 +254,8 @@ async fn handle_network_event(
             api_probe,
             webcam_start,
             active_webcam,
-        )?;
+        )
+        .await?;
         refresh_selected_addresses(
             lifecycle,
             virtual_camera,
@@ -284,7 +290,8 @@ async fn handle_network_event(
             api_probe,
             webcam_start,
             active_webcam,
-        )?;
+        )
+        .await?;
         return Ok(());
     }
 
@@ -312,7 +319,7 @@ async fn reconcile(
     }
     if lifecycle.state.kind() != CameraStateKind::Ready {
         *webcam_start = None;
-        *active_webcam = None;
+        discard_active_webcam(active_webcam).await;
     }
     refresh_selected_addresses(
         lifecycle,
@@ -349,11 +356,12 @@ async fn refresh_selected_addresses(
         webcam_start,
         active_webcam,
     )
+    .await
 }
 
 /// Dispatches state effects and keeps the single in-flight TCP probe aligned
 /// with lifecycle state. Dropping the future cancels a stale connect attempt.
-fn dispatch_runtime(
+async fn dispatch_runtime(
     lifecycle: &Lifecycle,
     events: Vec<LifecycleEvent>,
     camera_output: &mut impl CameraOutput,
@@ -375,10 +383,10 @@ fn dispatch_runtime(
 
     if leaving_ready {
         *webcam_start = None;
-        *active_webcam = None;
+        discard_active_webcam(active_webcam).await;
     }
     if let Some(endpoint) = webcam_request {
-        *active_webcam = None;
+        discard_active_webcam(active_webcam).await;
         *webcam_start = Some(Box::pin(start_webcam_mode(endpoint)));
     }
 
@@ -411,25 +419,38 @@ async fn start_webcam_mode(endpoint: ControlEndpoint) -> WebcamStartResult {
             return WebcamStartResult {
                 endpoint,
                 client: None,
+                stream: None,
                 outcome: WebcamStartOutcome::StartFailed(error.to_string()),
             };
         }
     };
 
-    if let Err(error) = client.start_webcam(WebcamConfiguration::INITIAL).await {
+    let configuration = WebcamConfiguration::INITIAL;
+    let stream = match StreamSocket::bind(endpoint.host_address, configuration.udp_port()).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            return WebcamStartResult {
+                endpoint,
+                client: Some(client),
+                stream: None,
+                outcome: WebcamStartOutcome::StartFailed(error.to_string()),
+            };
+        }
+    };
+
+    if let Err(error) = client.start_webcam(configuration).await {
         return WebcamStartResult {
             endpoint,
             client: Some(client),
+            stream: Some(stream),
             outcome: WebcamStartOutcome::StartFailed(error.to_string()),
         };
     }
-    if let Err(error) = client
-        .set_webcam_fov(WebcamConfiguration::INITIAL.fov())
-        .await
-    {
+    if let Err(error) = client.set_webcam_fov(configuration.fov()).await {
         return WebcamStartResult {
             endpoint,
             client: Some(client),
+            stream: Some(stream),
             outcome: WebcamStartOutcome::FovFailed(error.to_string()),
         };
     }
@@ -437,12 +458,13 @@ async fn start_webcam_mode(endpoint: ControlEndpoint) -> WebcamStartResult {
     WebcamStartResult {
         endpoint,
         client: Some(client),
+        stream: Some(stream),
         outcome: WebcamStartOutcome::Started,
     }
 }
 
 /// Applies only completions that still belong to the current ready session.
-fn apply_webcam_start_result(
+async fn apply_webcam_start_result(
     lifecycle: &Lifecycle,
     result: WebcamStartResult,
     active_webcam: &mut Option<ActiveWebcam>,
@@ -463,16 +485,21 @@ fn apply_webcam_start_result(
             let client = result
                 .client
                 .expect("successful webcam start retains its client");
+            let stream = result
+                .stream
+                .expect("successful webcam start retains its UDP receiver");
+            discard_active_webcam(active_webcam).await;
             *active_webcam = Some(ActiveWebcam {
                 endpoint: result.endpoint,
                 client,
+                stream: stream.monitor(),
             });
             info!(
                 event = "gopro_webcam_started",
                 control_address = %result.endpoint.control_address,
                 resolution = 1080,
                 fov = "linear",
-                udp_port = 8554,
+                udp_port = WebcamConfiguration::INITIAL.udp_port(),
                 "GoPro entered webcam mode"
             );
         }
@@ -481,16 +508,21 @@ fn apply_webcam_start_result(
                 event = "gopro_webcam_start_failed",
                 control_address = %result.endpoint.control_address,
                 resolution = 1080,
-                udp_port = 8554,
+                udp_port = WebcamConfiguration::INITIAL.udp_port(),
                 %error,
                 "GoPro webcam start failed; waiting for a future readiness transition"
             );
         }
         WebcamStartOutcome::FovFailed(error) => {
             if let Some(client) = result.client {
+                let stream = result
+                    .stream
+                    .expect("started webcam retains its UDP receiver after an FOV failure");
+                discard_active_webcam(active_webcam).await;
                 *active_webcam = Some(ActiveWebcam {
                     endpoint: result.endpoint,
                     client,
+                    stream: stream.monitor(),
                 });
             }
             warn!(
@@ -519,6 +551,8 @@ async fn stop_active_webcam(active_webcam: &mut Option<ActiveWebcam>) {
         return;
     };
 
+    active.stream.stop().await;
+
     match active.client.stop_webcam().await {
         Ok(()) => info!(
             event = "gopro_webcam_stopped",
@@ -531,6 +565,15 @@ async fn stop_active_webcam(active_webcam: &mut Option<ActiveWebcam>) {
             %error,
             "failed to stop GoPro webcam mode during shutdown"
         ),
+    }
+}
+
+/// Stops only stream reception when a hotplug transition invalidates an active
+/// session. The control endpoint may already be unreachable, so HTTP STOP is
+/// intentionally reserved for orderly daemon shutdown.
+async fn discard_active_webcam(active_webcam: &mut Option<ActiveWebcam>) {
+    if let Some(active) = active_webcam.take() {
+        active.stream.stop().await;
     }
 }
 
