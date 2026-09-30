@@ -1,3 +1,4 @@
+mod gopro;
 mod hotplug;
 mod network;
 mod settings;

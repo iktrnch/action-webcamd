@@ -3,6 +3,7 @@ use std::{
     ffi::OsStr,
     future,
     net::{IpAddr, SocketAddr},
+    pin::Pin,
 };
 
 use anyhow::{Context, Result, bail};
@@ -18,9 +19,29 @@ use tracing::{debug, info, warn};
 
 use super::{lifecycle::*, model::*};
 use crate::{
+    gopro::{GoProClient, WebcamConfiguration},
     network::AddressMonitor,
     virtual_camera::{CameraOutput, VirtualCamera},
 };
+
+type WebcamStartFuture = Pin<Box<dyn Future<Output = WebcamStartResult>>>;
+
+struct ActiveWebcam {
+    endpoint: ControlEndpoint,
+    client: GoProClient,
+}
+
+struct WebcamStartResult {
+    endpoint: ControlEndpoint,
+    client: Option<GoProClient>,
+    outcome: WebcamStartOutcome,
+}
+
+enum WebcamStartOutcome {
+    Started,
+    StartFailed(String),
+    FovFailed(String),
+}
 
 pub(crate) async fn run(
     mut virtual_camera: VirtualCamera,
@@ -31,6 +52,8 @@ pub(crate) async fn run(
     let mut address_monitor = AddressMonitor::open()?;
     let mut lifecycle = Lifecycle::default();
     let mut api_probe = None;
+    let mut webcam_start = None;
+    let mut active_webcam = None;
 
     reconcile(
         &mut lifecycle,
@@ -38,6 +61,8 @@ pub(crate) async fn run(
         &mut virtual_camera,
         &address_monitor,
         &mut api_probe,
+        &mut webcam_start,
+        &mut active_webcam,
     )
     .await
     .context("failed to enumerate devices during startup")?;
@@ -52,32 +77,32 @@ pub(crate) async fn run(
             result = &mut shutdown => {
                 result?;
                 info!(event = "daemon_stopping", "shutdown signal received");
+                stop_active_webcam(&mut active_webcam).await;
                 virtual_camera.stop().context("failed to stop virtual camera during shutdown")?;
                 return Ok(());
             }
             failure = producer_failures.recv() => {
-                let Some(error) = failure else {
-                    bail!("virtual camera producer failure channel closed unexpectedly");
-                };
+                let error = failure.unwrap_or_else(|| anyhow::anyhow!("virtual camera producer failure channel closed unexpectedly"));
+                stop_active_webcam(&mut active_webcam).await;
                 virtual_camera.stop().context("failed to stop failed virtual camera producer")?;
                 return Err(error);
             }
             item = usb_monitor.next() => {
                 match item {
-                    Some(Ok(event)) => handle_usb_event(&mut lifecycle, &event, &mut virtual_camera, &address_monitor, &mut api_probe).await?,
+                    Some(Ok(event)) => handle_usb_event(&mut lifecycle, &event, &mut virtual_camera, &address_monitor, &mut api_probe, &mut webcam_start, &mut active_webcam).await?,
                     Some(Err(error)) => {
                         warn!(%error, event = "udev_receive_error", subsystem = "usb", "failed to receive USB udev event; reconciling");
-                        reconcile(&mut lifecycle, EventSource::Reconcile, &mut virtual_camera, &address_monitor, &mut api_probe).await?;
+                        reconcile(&mut lifecycle, EventSource::Reconcile, &mut virtual_camera, &address_monitor, &mut api_probe, &mut webcam_start, &mut active_webcam).await?;
                     }
                     None => bail!("USB udev monitor ended unexpectedly"),
                 }
             }
             item = network_monitor.next() => {
                 match item {
-                    Some(Ok(event)) => handle_network_event(&mut lifecycle, &event, &mut virtual_camera, &address_monitor, &mut api_probe).await?,
+                    Some(Ok(event)) => handle_network_event(&mut lifecycle, &event, &mut virtual_camera, &address_monitor, &mut api_probe, &mut webcam_start, &mut active_webcam).await?,
                     Some(Err(error)) => {
                         warn!(%error, event = "udev_receive_error", subsystem = "net", "failed to receive network udev event; reconciling");
-                        reconcile(&mut lifecycle, EventSource::Reconcile, &mut virtual_camera, &address_monitor, &mut api_probe).await?;
+                        reconcile(&mut lifecycle, EventSource::Reconcile, &mut virtual_camera, &address_monitor, &mut api_probe, &mut webcam_start, &mut active_webcam).await?;
                     }
                     None => bail!("network udev monitor ended unexpectedly"),
                 }
@@ -86,7 +111,7 @@ pub(crate) async fn run(
                 let change = change?;
                 if lifecycle.selected_network().is_some_and(|network| network.ifindex == change.ifindex) {
                     debug!(event = "gopro_ipv4_address_changed", ifindex = change.ifindex, address = %change.address, "refreshing GoPro USB-network addresses");
-                    refresh_selected_addresses(&mut lifecycle, &mut virtual_camera, &address_monitor, &mut api_probe).await?;
+                    refresh_selected_addresses(&mut lifecycle, &mut virtual_camera, &address_monitor, &mut api_probe, &mut webcam_start, &mut active_webcam).await?;
                 }
             }
             result = next_api_probe(&mut api_probe) => {
@@ -96,7 +121,11 @@ pub(crate) async fn run(
                     Err(error) => Observation::ApiProbeFailed { ifindex: result.ifindex, endpoint: result.endpoint, error },
                 };
                 let events = lifecycle.apply(observation);
-                dispatch_runtime(&lifecycle, events, &mut virtual_camera, &mut api_probe)?;
+                dispatch_runtime(&lifecycle, events, &mut virtual_camera, &mut api_probe, &mut webcam_start, &mut active_webcam)?;
+            }
+            result = next_webcam_start(&mut webcam_start) => {
+                webcam_start = None;
+                apply_webcam_start_result(&lifecycle, result, &mut active_webcam);
             }
         }
     }
@@ -124,6 +153,8 @@ async fn handle_usb_event(
     virtual_camera: &mut VirtualCamera,
     address_monitor: &AddressMonitor,
     api_probe: &mut Option<ApiProbeFuture>,
+    webcam_start: &mut Option<WebcamStartFuture>,
+    active_webcam: &mut Option<ActiveWebcam>,
 ) -> Result<()> {
     let usb_path = event.syspath().to_path_buf();
     let observation = match event.event_type() {
@@ -145,7 +176,14 @@ async fn handle_usb_event(
 
     let active_was_removed = matches!(&observation, Observation::UsbRemoved { usb_path } if lifecycle.selected_camera().is_some_and(|camera| camera.usb_path == *usb_path));
     let events = lifecycle.apply(observation);
-    dispatch_runtime(lifecycle, events, virtual_camera, api_probe)?;
+    dispatch_runtime(
+        lifecycle,
+        events,
+        virtual_camera,
+        api_probe,
+        webcam_start,
+        active_webcam,
+    )?;
 
     if active_was_removed && !lifecycle.has_active_camera() {
         reconcile(
@@ -154,6 +192,8 @@ async fn handle_usb_event(
             virtual_camera,
             address_monitor,
             api_probe,
+            webcam_start,
+            active_webcam,
         )
         .await?;
     }
@@ -169,6 +209,8 @@ async fn handle_network_event(
     virtual_camera: &mut VirtualCamera,
     address_monitor: &AddressMonitor,
     api_probe: &mut Option<ApiProbeFuture>,
+    webcam_start: &mut Option<WebcamStartFuture>,
+    active_webcam: &mut Option<ActiveWebcam>,
 ) -> Result<()> {
     let event_type = event.event_type();
     if matches!(
@@ -190,11 +232,33 @@ async fn handle_network_event(
                 camera,
                 source: EventSource::Udev,
             });
-            dispatch_runtime(lifecycle, events, virtual_camera, api_probe)?;
+            dispatch_runtime(
+                lifecycle,
+                events,
+                virtual_camera,
+                api_probe,
+                webcam_start,
+                active_webcam,
+            )?;
         }
         let events = lifecycle.apply(Observation::NetworkUpsert(network));
-        dispatch_runtime(lifecycle, events, virtual_camera, api_probe)?;
-        refresh_selected_addresses(lifecycle, virtual_camera, address_monitor, api_probe).await?;
+        dispatch_runtime(
+            lifecycle,
+            events,
+            virtual_camera,
+            api_probe,
+            webcam_start,
+            active_webcam,
+        )?;
+        refresh_selected_addresses(
+            lifecycle,
+            virtual_camera,
+            address_monitor,
+            api_probe,
+            webcam_start,
+            active_webcam,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -213,7 +277,14 @@ async fn handle_network_event(
             usb_path,
         };
         let events = lifecycle.apply(observation);
-        dispatch_runtime(lifecycle, events, virtual_camera, api_probe)?;
+        dispatch_runtime(
+            lifecycle,
+            events,
+            virtual_camera,
+            api_probe,
+            webcam_start,
+            active_webcam,
+        )?;
         return Ok(());
     }
 
@@ -230,6 +301,8 @@ async fn reconcile(
     virtual_camera: &mut VirtualCamera,
     address_monitor: &AddressMonitor,
     api_probe: &mut Option<ApiProbeFuture>,
+    webcam_start: &mut Option<WebcamStartFuture>,
+    active_webcam: &mut Option<ActiveWebcam>,
 ) -> Result<()> {
     let cameras = enumerate_usb_cameras()?;
     let networks = enumerate_gopro_networks()?;
@@ -237,7 +310,19 @@ async fn reconcile(
     if lifecycle.state.kind() != CameraStateKind::WaitingForApi {
         *api_probe = None;
     }
-    refresh_selected_addresses(lifecycle, virtual_camera, address_monitor, api_probe).await
+    if lifecycle.state.kind() != CameraStateKind::Ready {
+        *webcam_start = None;
+        *active_webcam = None;
+    }
+    refresh_selected_addresses(
+        lifecycle,
+        virtual_camera,
+        address_monitor,
+        api_probe,
+        webcam_start,
+        active_webcam,
+    )
+    .await
 }
 
 /// Reconciles the selected interface's address inventory after udev discovery
@@ -247,6 +332,8 @@ async fn refresh_selected_addresses(
     virtual_camera: &mut VirtualCamera,
     address_monitor: &AddressMonitor,
     api_probe: &mut Option<ApiProbeFuture>,
+    webcam_start: &mut Option<WebcamStartFuture>,
+    active_webcam: &mut Option<ActiveWebcam>,
 ) -> Result<()> {
     let Some(network) = lifecycle.selected_network() else {
         return Ok(());
@@ -254,7 +341,14 @@ async fn refresh_selected_addresses(
     let ifindex = network.ifindex;
     let addresses = address_monitor.addresses_for(ifindex).await?;
     let events = lifecycle.apply(Observation::NetworkAddressesChanged { ifindex, addresses });
-    dispatch_runtime(lifecycle, events, virtual_camera, api_probe)
+    dispatch_runtime(
+        lifecycle,
+        events,
+        virtual_camera,
+        api_probe,
+        webcam_start,
+        active_webcam,
+    )
 }
 
 /// Dispatches state effects and keeps the single in-flight TCP probe aligned
@@ -264,17 +358,180 @@ fn dispatch_runtime(
     events: Vec<LifecycleEvent>,
     camera_output: &mut impl CameraOutput,
     api_probe: &mut Option<ApiProbeFuture>,
+    webcam_start: &mut Option<WebcamStartFuture>,
+    active_webcam: &mut Option<ActiveWebcam>,
 ) -> Result<()> {
-    let request = api_probe_request(&events);
+    let api_request = api_probe_request(&events);
+    let webcam_request = webcam_start_request(&events);
+    let leaving_ready = events.iter().any(|event| {
+        matches!(
+            event,
+            LifecycleEvent::StateTransition { from: CameraStateKind::Ready, to, .. }
+                if *to != CameraStateKind::Ready
+        )
+    });
     let waiting_for_api = lifecycle.state.kind() == CameraStateKind::WaitingForApi;
     dispatch_all(events, camera_output)?;
 
-    if let Some((ifindex, endpoint)) = request {
+    if leaving_ready {
+        *webcam_start = None;
+        *active_webcam = None;
+    }
+    if let Some(endpoint) = webcam_request {
+        *active_webcam = None;
+        *webcam_start = Some(Box::pin(start_webcam_mode(endpoint)));
+    }
+
+    if let Some((ifindex, endpoint)) = api_request {
         *api_probe = Some(Box::pin(probe_control_endpoint(ifindex, endpoint)));
     } else if !waiting_for_api {
         *api_probe = None;
     }
     Ok(())
+}
+
+/// Extracts the readiness transition that should configure webcam mode once.
+pub(super) fn webcam_start_request(events: &[LifecycleEvent]) -> Option<ControlEndpoint> {
+    events.iter().find_map(|event| match event {
+        LifecycleEvent::StateTransition {
+            to: CameraStateKind::Ready,
+            endpoint: Some(endpoint),
+            ..
+        } => Some(*endpoint),
+        _ => None,
+    })
+}
+
+/// Runs the ordered START then FOV configuration without blocking hotplug
+/// monitoring. Dropping this future cancels it when the session goes stale.
+async fn start_webcam_mode(endpoint: ControlEndpoint) -> WebcamStartResult {
+    let client = match GoProClient::new(endpoint.host_address, endpoint.control_address) {
+        Ok(client) => client,
+        Err(error) => {
+            return WebcamStartResult {
+                endpoint,
+                client: None,
+                outcome: WebcamStartOutcome::StartFailed(error.to_string()),
+            };
+        }
+    };
+
+    if let Err(error) = client.start_webcam(WebcamConfiguration::INITIAL).await {
+        return WebcamStartResult {
+            endpoint,
+            client: Some(client),
+            outcome: WebcamStartOutcome::StartFailed(error.to_string()),
+        };
+    }
+    if let Err(error) = client
+        .set_webcam_fov(WebcamConfiguration::INITIAL.fov())
+        .await
+    {
+        return WebcamStartResult {
+            endpoint,
+            client: Some(client),
+            outcome: WebcamStartOutcome::FovFailed(error.to_string()),
+        };
+    }
+
+    WebcamStartResult {
+        endpoint,
+        client: Some(client),
+        outcome: WebcamStartOutcome::Started,
+    }
+}
+
+/// Applies only completions that still belong to the current ready session.
+fn apply_webcam_start_result(
+    lifecycle: &Lifecycle,
+    result: WebcamStartResult,
+    active_webcam: &mut Option<ActiveWebcam>,
+) {
+    if lifecycle.state.kind() != CameraStateKind::Ready
+        || lifecycle.state.endpoint() != Some(result.endpoint)
+    {
+        debug!(
+            event = "gopro_webcam_start_stale",
+            control_address = %result.endpoint.control_address,
+            "ignoring webcam control completion for a stale session"
+        );
+        return;
+    }
+
+    match result.outcome {
+        WebcamStartOutcome::Started => {
+            let client = result
+                .client
+                .expect("successful webcam start retains its client");
+            *active_webcam = Some(ActiveWebcam {
+                endpoint: result.endpoint,
+                client,
+            });
+            info!(
+                event = "gopro_webcam_started",
+                control_address = %result.endpoint.control_address,
+                resolution = 1080,
+                fov = "linear",
+                udp_port = 8554,
+                "GoPro entered webcam mode"
+            );
+        }
+        WebcamStartOutcome::StartFailed(error) => {
+            warn!(
+                event = "gopro_webcam_start_failed",
+                control_address = %result.endpoint.control_address,
+                resolution = 1080,
+                udp_port = 8554,
+                %error,
+                "GoPro webcam start failed; waiting for a future readiness transition"
+            );
+        }
+        WebcamStartOutcome::FovFailed(error) => {
+            if let Some(client) = result.client {
+                *active_webcam = Some(ActiveWebcam {
+                    endpoint: result.endpoint,
+                    client,
+                });
+            }
+            warn!(
+                event = "gopro_webcam_fov_failed",
+                control_address = %result.endpoint.control_address,
+                fov = "linear",
+                %error,
+                "GoPro webcam started but Linear FOV was not applied"
+            );
+        }
+    }
+}
+
+/// Waits for the active webcam configuration, or forever when none is active.
+async fn next_webcam_start(start: &mut Option<WebcamStartFuture>) -> WebcamStartResult {
+    match start {
+        Some(start) => start.await,
+        None => future::pending().await,
+    }
+}
+
+/// Stops an active camera on process shutdown without turning a clean shutdown
+/// into a daemon failure when the USB link has already disappeared.
+async fn stop_active_webcam(active_webcam: &mut Option<ActiveWebcam>) {
+    let Some(active) = active_webcam.take() else {
+        return;
+    };
+
+    match active.client.stop_webcam().await {
+        Ok(()) => info!(
+            event = "gopro_webcam_stopped",
+            control_address = %active.endpoint.control_address,
+            "GoPro exited webcam mode"
+        ),
+        Err(error) => warn!(
+            event = "gopro_webcam_stop_failed",
+            control_address = %active.endpoint.control_address,
+            %error,
+            "failed to stop GoPro webcam mode during shutdown"
+        ),
+    }
 }
 
 /// Extracts a newly requested probe from the transition that introduced its

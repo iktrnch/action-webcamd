@@ -10,9 +10,14 @@ futures-channel = "0.3"
 netlink-packet-core = "0.9"
 netlink-packet-route = "0.33"
 netlink-sys = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 rtnetlink = "0.23"
+serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "net", "rt", "signal", "sync", "time"] }
 tokio-udev = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 v4l = "0.14"
+
+[dev-dependencies]
+serde_json = "1"

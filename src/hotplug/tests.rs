@@ -64,6 +64,35 @@ fn transition_kinds(events: &[LifecycleEvent]) -> Vec<(CameraStateKind, CameraSt
         .collect()
 }
 
+/// Webcam control is armed only by the single transition that proves the
+/// selected camera's HTTP endpoint is ready.
+#[test]
+fn webcam_start_is_requested_only_after_readiness() {
+    let endpoint = ControlEndpoint::from_host_address(Ipv4Addr::new(172, 27, 187, 52));
+    let identity = camera("/sys/camera-a", Some("C123"));
+    let interface = network("/sys/net/enx1", "/sys/camera-a", "enx1");
+
+    let ready = LifecycleEvent::StateTransition {
+        from: CameraStateKind::WaitingForApi,
+        to: CameraStateKind::Ready,
+        camera: Some(identity.clone()),
+        network: Some(interface.clone()),
+        endpoint: Some(endpoint),
+        source: None,
+    };
+    let waiting = LifecycleEvent::StateTransition {
+        from: CameraStateKind::WaitingForAddress,
+        to: CameraStateKind::WaitingForApi,
+        camera: Some(identity),
+        network: Some(interface),
+        endpoint: Some(endpoint),
+        source: None,
+    };
+
+    assert_eq!(webcam_start_request(&[ready]), Some(endpoint));
+    assert_eq!(webcam_start_request(&[waiting]), None);
+}
+
 /// Verifies black output starts at USB detection and stops only on session
 /// teardown, rather than at the intermediate network states.
 #[test]
