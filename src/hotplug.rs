@@ -2,19 +2,33 @@ use std::{
     collections::HashSet,
     ffi::OsStr,
     fmt,
+    future::Future,
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     path::{Path, PathBuf},
+    pin::Pin,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
-use futures_util::StreamExt;
-use tokio::signal::unix::{SignalKind, signal};
+use futures_util::{StreamExt, future};
 use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::{
+    net::TcpSocket,
+    signal::unix::{SignalKind, signal},
+    time::timeout,
+};
 use tokio_udev::{AsyncMonitorSocket, Device, Enumerator, Event, EventType, MonitorBuilder};
 use tracing::{debug, info, warn};
 
-use crate::virtual_camera::{CameraOutput, VirtualCamera};
+use crate::{
+    network::AddressMonitor,
+    virtual_camera::{CameraOutput, VirtualCamera},
+};
 
 const GOPRO_VENDOR_ID: u16 = 0x2672;
+const GOPRO_CONTROL_LAST_OCTET: u8 = 51;
+const GOPRO_CONTROL_PORT: u16 = 80;
+const GOPRO_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Describes where a camera observation originated so lifecycle logs can
 /// distinguish initial discovery, live hotplug events, and recovery scans.
@@ -100,7 +114,7 @@ impl CameraIdentity {
 struct NetworkInterface {
     sysfs_path: PathBuf,
     name: String,
-    ifindex: Option<u32>,
+    ifindex: u32,
     mac_address: Option<String>,
     driver: Option<String>,
     usb_path: PathBuf,
@@ -121,11 +135,34 @@ impl NetworkInterface {
             name: property(device, "INTERFACE").unwrap_or_else(|| os_to_string(device.sysname())),
             ifindex: property(device, "IFINDEX")
                 .and_then(|value| value.parse().ok())
-                .or_else(|| attribute(device, "ifindex").and_then(|value| value.parse().ok())),
+                .or_else(|| attribute(device, "ifindex").and_then(|value| value.parse().ok()))
+                .context("GoPro network interface is missing its kernel index")?,
             mac_address: attribute(device, "address"),
             driver,
             usb_path: usb_parent.syspath().to_path_buf(),
         }))
+    }
+}
+
+/// The host and GoPro control addresses derived from the selected USB network.
+/// GoPro's legacy USB webcam API listens on the `.51` peer address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ControlEndpoint {
+    host_address: Ipv4Addr,
+    control_address: Ipv4Addr,
+}
+
+impl ControlEndpoint {
+    fn from_host_address(host_address: Ipv4Addr) -> Self {
+        let [first, second, third, _] = host_address.octets();
+        Self {
+            host_address,
+            control_address: Ipv4Addr::new(first, second, third, GOPRO_CONTROL_LAST_OCTET),
+        }
+    }
+
+    fn socket_address(self) -> SocketAddrV4 {
+        SocketAddrV4::new(self.control_address, GOPRO_CONTROL_PORT)
     }
 }
 
@@ -147,14 +184,24 @@ enum Observation {
         ifindex: Option<u32>,
         usb_path: Option<PathBuf>,
     },
+    NetworkAddressesChanged {
+        ifindex: u32,
+        addresses: Vec<Ipv4Addr>,
+    },
+    ApiProbeSucceeded {
+        ifindex: u32,
+        endpoint: ControlEndpoint,
+    },
+    ApiProbeFailed {
+        ifindex: u32,
+        endpoint: ControlEndpoint,
+        error: String,
+    },
 }
 
-/// The explicit lifecycle of the selected GoPro session.
-///
-/// `DeviceDetected` and `Ready` are deliberate, observable transition points;
-/// the reducer immediately advances them to `WaitingForNetwork` and
-/// `Streaming` respectively because this milestone has no asynchronous GoPro
-/// configuration step between those states.
+/// The explicit lifecycle of the selected GoPro session. Network and API
+/// readiness are distinct because a USB network interface can appear before
+/// the kernel assigns its IPv4 address or the camera opens its control port.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 enum CameraState {
     #[default]
@@ -165,13 +212,19 @@ enum CameraState {
     WaitingForNetwork {
         camera: CameraIdentity,
     },
-    Ready {
+    WaitingForAddress {
         camera: CameraIdentity,
         network: NetworkInterface,
     },
-    Streaming {
+    WaitingForApi {
         camera: CameraIdentity,
         network: NetworkInterface,
+        endpoint: ControlEndpoint,
+    },
+    Ready {
+        camera: CameraIdentity,
+        network: NetworkInterface,
+        endpoint: ControlEndpoint,
     },
 }
 
@@ -182,8 +235,9 @@ impl CameraState {
             Self::Disconnected => CameraStateKind::Disconnected,
             Self::DeviceDetected { .. } => CameraStateKind::DeviceDetected,
             Self::WaitingForNetwork { .. } => CameraStateKind::WaitingForNetwork,
+            Self::WaitingForAddress { .. } => CameraStateKind::WaitingForAddress,
+            Self::WaitingForApi { .. } => CameraStateKind::WaitingForApi,
             Self::Ready { .. } => CameraStateKind::Ready,
-            Self::Streaming { .. } => CameraStateKind::Streaming,
         }
     }
 
@@ -193,18 +247,33 @@ impl CameraState {
             Self::Disconnected => None,
             Self::DeviceDetected { camera }
             | Self::WaitingForNetwork { camera }
-            | Self::Ready { camera, .. }
-            | Self::Streaming { camera, .. } => Some(camera),
+            | Self::WaitingForAddress { camera, .. }
+            | Self::WaitingForApi { camera, .. }
+            | Self::Ready { camera, .. } => Some(camera),
         }
     }
 
     /// Returns the selected USB-network interface once it has been observed.
     fn network(&self) -> Option<&NetworkInterface> {
         match self {
-            Self::Ready { network, .. } | Self::Streaming { network, .. } => Some(network),
+            Self::WaitingForAddress { network, .. }
+            | Self::WaitingForApi { network, .. }
+            | Self::Ready { network, .. } => Some(network),
             Self::Disconnected | Self::DeviceDetected { .. } | Self::WaitingForNetwork { .. } => {
                 None
             }
+        }
+    }
+
+    /// Returns the endpoint while its connectivity is being checked or has
+    /// already been confirmed.
+    fn endpoint(&self) -> Option<ControlEndpoint> {
+        match self {
+            Self::WaitingForApi { endpoint, .. } | Self::Ready { endpoint, .. } => Some(*endpoint),
+            Self::Disconnected
+            | Self::DeviceDetected { .. }
+            | Self::WaitingForNetwork { .. }
+            | Self::WaitingForAddress { .. } => None,
         }
     }
 
@@ -218,25 +287,33 @@ impl CameraState {
             | Self::WaitingForNetwork {
                 camera: current_camera,
             }
-            | Self::Ready {
+            | Self::WaitingForAddress {
                 camera: current_camera,
                 ..
             }
-            | Self::Streaming {
+            | Self::WaitingForApi {
+                camera: current_camera,
+                ..
+            }
+            | Self::Ready {
                 camera: current_camera,
                 ..
             } => *current_camera = camera,
         }
     }
 
-    /// Refreshes network metadata while preserving the ready or streaming phase.
+    /// Refreshes network metadata while preserving the address/API phase.
     fn replace_network(&mut self, network: NetworkInterface) {
         match self {
-            Self::Ready {
+            Self::WaitingForAddress {
                 network: current_network,
                 ..
             }
-            | Self::Streaming {
+            | Self::WaitingForApi {
+                network: current_network,
+                ..
+            }
+            | Self::Ready {
                 network: current_network,
                 ..
             } => *current_network = network,
@@ -251,8 +328,9 @@ enum CameraStateKind {
     Disconnected,
     DeviceDetected,
     WaitingForNetwork,
+    WaitingForAddress,
+    WaitingForApi,
     Ready,
-    Streaming,
 }
 
 impl fmt::Display for CameraStateKind {
@@ -261,8 +339,9 @@ impl fmt::Display for CameraStateKind {
             Self::Disconnected => "disconnected",
             Self::DeviceDetected => "device_detected",
             Self::WaitingForNetwork => "waiting_for_network",
+            Self::WaitingForAddress => "waiting_for_address",
+            Self::WaitingForApi => "waiting_for_api",
             Self::Ready => "ready",
-            Self::Streaming => "streaming",
         })
     }
 }
@@ -276,12 +355,17 @@ enum LifecycleEvent {
         to: CameraStateKind,
         camera: Option<CameraIdentity>,
         network: Option<NetworkInterface>,
+        endpoint: Option<ControlEndpoint>,
         source: Option<EventSource>,
     },
     CameraIgnored(CameraIdentity),
     NetworkUpdated {
         previous: NetworkInterface,
         current: NetworkInterface,
+    },
+    ApiProbeFailed {
+        endpoint: ControlEndpoint,
+        error: String,
     },
 }
 
@@ -291,6 +375,15 @@ enum LifecycleEvent {
 struct Lifecycle {
     state: CameraState,
     ignored: HashSet<PathBuf>,
+}
+
+type ApiProbeFuture = Pin<Box<dyn Future<Output = ApiProbeResult>>>;
+
+#[derive(Debug)]
+struct ApiProbeResult {
+    ifindex: u32,
+    endpoint: ControlEndpoint,
+    result: Result<(), String>,
 }
 
 impl Lifecycle {
@@ -307,6 +400,17 @@ impl Lifecycle {
                 ifindex,
                 usb_path,
             } => self.remove_network(&sysfs_path, name.as_deref(), ifindex, usb_path.as_deref()),
+            Observation::NetworkAddressesChanged { ifindex, addresses } => {
+                self.update_network_addresses(ifindex, addresses)
+            }
+            Observation::ApiProbeSucceeded { ifindex, endpoint } => {
+                self.api_probe_succeeded(ifindex, endpoint)
+            }
+            Observation::ApiProbeFailed {
+                ifindex,
+                endpoint,
+                error,
+            } => self.api_probe_failed(ifindex, endpoint, error),
         }
     }
 
@@ -357,8 +461,8 @@ impl Lifecycle {
         vec![self.transition(CameraState::Disconnected, None)]
     }
 
-    /// Advances a selected camera to streaming when its USB network appears,
-    /// or refreshes network metadata without restarting an active stream.
+    /// Records the selected GoPro USB network interface, then waits for its
+    /// IPv4 address through netlink before any API check begins.
     fn upsert_network(&mut self, network: NetworkInterface) -> Vec<LifecycleEvent> {
         let Some(active_camera) = self.state.camera() else {
             return Vec::new();
@@ -367,42 +471,54 @@ impl Lifecycle {
         if active_camera.usb_path != network.usb_path {
             return Vec::new();
         }
+        let active_camera = active_camera.clone();
 
         match &self.state {
             CameraState::DeviceDetected { .. } | CameraState::WaitingForNetwork { .. } => {
-                let camera = active_camera.clone();
-                vec![
-                    self.transition(
-                        CameraState::Ready {
-                            camera: camera.clone(),
-                            network: network.clone(),
-                        },
-                        None,
-                    ),
-                    self.transition(CameraState::Streaming { camera, network }, None),
-                ]
+                vec![self.transition(
+                    CameraState::WaitingForAddress {
+                        camera: active_camera,
+                        network,
+                    },
+                    None,
+                )]
             }
-            CameraState::Ready {
+            CameraState::WaitingForAddress {
                 network: previous, ..
             }
-            | CameraState::Streaming {
+            | CameraState::WaitingForApi {
+                network: previous, ..
+            }
+            | CameraState::Ready {
                 network: previous, ..
             } => {
                 if previous == &network {
                     return Vec::new();
                 }
                 let previous = previous.clone();
+                let ifindex_changed = previous.ifindex != network.ifindex;
                 self.state.replace_network(network.clone());
-                vec![LifecycleEvent::NetworkUpdated {
+                let mut events = vec![LifecycleEvent::NetworkUpdated {
                     previous,
-                    current: network,
-                }]
+                    current: network.clone(),
+                }];
+                if ifindex_changed {
+                    events.push(self.transition(
+                        CameraState::WaitingForAddress {
+                            camera: active_camera,
+                            network,
+                        },
+                        None,
+                    ));
+                }
+                events
             }
             CameraState::Disconnected => Vec::new(),
         }
     }
 
-    /// Ends the selected session when its known USB-network interface vanishes.
+    /// Returns to waiting for the selected camera's USB network without
+    /// stopping black output; physical USB removal remains the session boundary.
     fn remove_network(
         &mut self,
         sysfs_path: &Path,
@@ -415,7 +531,7 @@ impl Lifecycle {
         };
 
         let same_path = current.sysfs_path == sysfs_path;
-        let same_ifindex = ifindex.is_some() && current.ifindex == ifindex;
+        let same_ifindex = ifindex == Some(current.ifindex);
         let same_name_and_parent = name.is_some_and(|value| current.name == value)
             && usb_path.is_some_and(|value| current.usb_path == value);
 
@@ -423,7 +539,101 @@ impl Lifecycle {
             return Vec::new();
         }
 
-        vec![self.transition(CameraState::Disconnected, None)]
+        let Some(camera) = self.state.camera().cloned() else {
+            return Vec::new();
+        };
+        vec![self.transition(CameraState::WaitingForNetwork { camera }, None)]
+    }
+
+    /// Replaces the active interface's IPv4 inventory and requests exactly one
+    /// asynchronous TCP probe whenever a usable host address changes.
+    fn update_network_addresses(
+        &mut self,
+        ifindex: u32,
+        mut addresses: Vec<Ipv4Addr>,
+    ) -> Vec<LifecycleEvent> {
+        let Some(network) = self.state.network() else {
+            return Vec::new();
+        };
+        if network.ifindex != ifindex {
+            return Vec::new();
+        }
+        addresses.sort_unstable();
+        let address = addresses.into_iter().next();
+        let Some(camera) = self.state.camera().cloned() else {
+            return Vec::new();
+        };
+        let network = network.clone();
+
+        let Some(host_address) = address else {
+            return match self.state.kind() {
+                CameraStateKind::WaitingForAddress => Vec::new(),
+                _ => {
+                    vec![self.transition(CameraState::WaitingForAddress { camera, network }, None)]
+                }
+            };
+        };
+        let endpoint = ControlEndpoint::from_host_address(host_address);
+        if self.state.endpoint() == Some(endpoint)
+            && self.state.kind() == CameraStateKind::WaitingForApi
+        {
+            return Vec::new();
+        }
+        vec![self.transition(
+            CameraState::WaitingForApi {
+                camera,
+                network,
+                endpoint,
+            },
+            None,
+        )]
+    }
+
+    /// Marks an in-state TCP probe as ready and ignores stale completions.
+    fn api_probe_succeeded(
+        &mut self,
+        ifindex: u32,
+        endpoint: ControlEndpoint,
+    ) -> Vec<LifecycleEvent> {
+        let CameraState::WaitingForApi {
+            camera,
+            network,
+            endpoint: current_endpoint,
+        } = &self.state
+        else {
+            return Vec::new();
+        };
+        if network.ifindex != ifindex || *current_endpoint != endpoint {
+            return Vec::new();
+        }
+        vec![self.transition(
+            CameraState::Ready {
+                camera: camera.clone(),
+                network: network.clone(),
+                endpoint,
+            },
+            None,
+        )]
+    }
+
+    /// Keeps API failures recoverable: the next relevant netlink address event
+    /// will request a fresh probe, without an arbitrary retry loop.
+    fn api_probe_failed(
+        &mut self,
+        ifindex: u32,
+        endpoint: ControlEndpoint,
+        error: String,
+    ) -> Vec<LifecycleEvent> {
+        let Some(network) = self.state.network() else {
+            return Vec::new();
+        };
+        if self.state.kind() != CameraStateKind::WaitingForApi
+            || network.ifindex != ifindex
+            || self.state.endpoint() != Some(endpoint)
+        {
+            return Vec::new();
+        }
+        vec![LifecycleEvent::ApiProbeFailed { endpoint, error }]
     }
 
     /// Records a state transition after retaining snapshots useful after unplug.
@@ -432,12 +642,14 @@ impl Lifecycle {
         let to = next.kind();
         let camera = next.camera().or_else(|| self.state.camera()).cloned();
         let network = next.network().or_else(|| self.state.network()).cloned();
+        let endpoint = next.endpoint().or_else(|| self.state.endpoint());
         self.state = next;
         LifecycleEvent::StateTransition {
             from,
             to,
             camera,
             network,
+            endpoint,
             source,
         }
     }
@@ -447,7 +659,7 @@ impl Lifecycle {
         self.state.camera()
     }
 
-    /// Returns the selected network interface once it is ready or streaming.
+    /// Returns the selected network interface once udev has correlated it.
     fn selected_network(&self) -> Option<&NetworkInterface> {
         self.state.network()
     }
@@ -466,10 +678,19 @@ pub(crate) async fn run(
 ) -> Result<()> {
     let mut usb_monitor = monitor_usb().context("failed to open USB udev monitor")?;
     let mut network_monitor = monitor_network().context("failed to open network udev monitor")?;
+    let mut address_monitor = AddressMonitor::open()?;
     let mut lifecycle = Lifecycle::default();
+    let mut api_probe = None;
 
-    reconcile(&mut lifecycle, EventSource::Startup, &mut virtual_camera)
-        .context("failed to enumerate devices during startup")?;
+    reconcile(
+        &mut lifecycle,
+        EventSource::Startup,
+        &mut virtual_camera,
+        &address_monitor,
+        &mut api_probe,
+    )
+    .await
+    .context("failed to enumerate devices during startup")?;
 
     info!(event = "hotplug_monitor_started", "hotplug monitor started");
 
@@ -493,23 +714,39 @@ pub(crate) async fn run(
             }
             item = usb_monitor.next() => {
                 match item {
-                    Some(Ok(event)) => handle_usb_event(&mut lifecycle, &event, &mut virtual_camera)?,
+                    Some(Ok(event)) => handle_usb_event(&mut lifecycle, &event, &mut virtual_camera, &address_monitor, &mut api_probe).await?,
                     Some(Err(error)) => {
                         warn!(%error, event = "udev_receive_error", subsystem = "usb", "failed to receive USB udev event; reconciling");
-                        reconcile(&mut lifecycle, EventSource::Reconcile, &mut virtual_camera)?;
+                        reconcile(&mut lifecycle, EventSource::Reconcile, &mut virtual_camera, &address_monitor, &mut api_probe).await?;
                     }
                     None => bail!("USB udev monitor ended unexpectedly"),
                 }
             }
             item = network_monitor.next() => {
                 match item {
-                    Some(Ok(event)) => handle_network_event(&mut lifecycle, &event, &mut virtual_camera)?,
+                    Some(Ok(event)) => handle_network_event(&mut lifecycle, &event, &mut virtual_camera, &address_monitor, &mut api_probe).await?,
                     Some(Err(error)) => {
                         warn!(%error, event = "udev_receive_error", subsystem = "net", "failed to receive network udev event; reconciling");
-                        reconcile(&mut lifecycle, EventSource::Reconcile, &mut virtual_camera)?;
+                        reconcile(&mut lifecycle, EventSource::Reconcile, &mut virtual_camera, &address_monitor, &mut api_probe).await?;
                     }
                     None => bail!("network udev monitor ended unexpectedly"),
                 }
+            }
+            change = address_monitor.next_change() => {
+                let change = change?;
+                if lifecycle.selected_network().is_some_and(|network| network.ifindex == change.ifindex) {
+                    debug!(event = "gopro_ipv4_address_changed", ifindex = change.ifindex, address = %change.address, "refreshing GoPro USB-network addresses");
+                    refresh_selected_addresses(&mut lifecycle, &mut virtual_camera, &address_monitor, &mut api_probe).await?;
+                }
+            }
+            result = next_api_probe(&mut api_probe) => {
+                api_probe = None;
+                let observation = match result.result {
+                    Ok(()) => Observation::ApiProbeSucceeded { ifindex: result.ifindex, endpoint: result.endpoint },
+                    Err(error) => Observation::ApiProbeFailed { ifindex: result.ifindex, endpoint: result.endpoint, error },
+                };
+                let events = lifecycle.apply(observation);
+                dispatch_runtime(&lifecycle, events, &mut virtual_camera, &mut api_probe)?;
             }
         }
     }
@@ -531,10 +768,12 @@ fn monitor_network() -> Result<AsyncMonitorSocket> {
 
 /// Converts one USB udev event into a lifecycle observation and reconciles
 /// remaining cameras after the active camera disconnects.
-fn handle_usb_event(
+async fn handle_usb_event(
     lifecycle: &mut Lifecycle,
     event: &Event,
     virtual_camera: &mut VirtualCamera,
+    address_monitor: &AddressMonitor,
+    api_probe: &mut Option<ApiProbeFuture>,
 ) -> Result<()> {
     let usb_path = event.syspath().to_path_buf();
     let observation = match event.event_type() {
@@ -555,10 +794,18 @@ fn handle_usb_event(
     };
 
     let active_was_removed = matches!(&observation, Observation::UsbRemoved { usb_path } if lifecycle.selected_camera().is_some_and(|camera| camera.usb_path == *usb_path));
-    dispatch_all(lifecycle.apply(observation), virtual_camera)?;
+    let events = lifecycle.apply(observation);
+    dispatch_runtime(lifecycle, events, virtual_camera, api_probe)?;
 
     if active_was_removed && !lifecycle.has_active_camera() {
-        reconcile(lifecycle, EventSource::Reconcile, virtual_camera)?;
+        reconcile(
+            lifecycle,
+            EventSource::Reconcile,
+            virtual_camera,
+            address_monitor,
+            api_probe,
+        )
+        .await?;
     }
 
     Ok(())
@@ -566,10 +813,12 @@ fn handle_usb_event(
 
 /// Converts one network udev event into lifecycle observations, ensuring the
 /// owning USB camera is observed before its interface.
-fn handle_network_event(
+async fn handle_network_event(
     lifecycle: &mut Lifecycle,
     event: &Event,
     virtual_camera: &mut VirtualCamera,
+    address_monitor: &AddressMonitor,
+    api_probe: &mut Option<ApiProbeFuture>,
 ) -> Result<()> {
     let event_type = event.event_type();
     if matches!(
@@ -587,18 +836,15 @@ fn handle_network_event(
         if let Some(parent) = gopro_usb_parent(event)?
             && let Some(camera) = CameraIdentity::from_device(&parent)
         {
-            dispatch_all(
-                lifecycle.apply(Observation::UsbUpsert {
-                    camera,
-                    source: EventSource::Udev,
-                }),
-                virtual_camera,
-            )?;
+            let events = lifecycle.apply(Observation::UsbUpsert {
+                camera,
+                source: EventSource::Udev,
+            });
+            dispatch_runtime(lifecycle, events, virtual_camera, api_probe)?;
         }
-        dispatch_all(
-            lifecycle.apply(Observation::NetworkUpsert(network)),
-            virtual_camera,
-        )?;
+        let events = lifecycle.apply(Observation::NetworkUpsert(network));
+        dispatch_runtime(lifecycle, events, virtual_camera, api_probe)?;
+        refresh_selected_addresses(lifecycle, virtual_camera, address_monitor, api_probe).await?;
         return Ok(());
     }
 
@@ -616,7 +862,8 @@ fn handle_network_event(
             ifindex: property(event, "IFINDEX").and_then(|value| value.parse().ok()),
             usb_path,
         };
-        dispatch_all(lifecycle.apply(observation), virtual_camera)?;
+        let events = lifecycle.apply(observation);
+        dispatch_runtime(lifecycle, events, virtual_camera, api_probe)?;
         return Ok(());
     }
 
@@ -627,14 +874,117 @@ fn handle_network_event(
 
 /// Rebuilds lifecycle state from the current sysfs inventory to cover startup,
 /// missed events, and promotion of an already-connected secondary camera.
-fn reconcile(
+async fn reconcile(
     lifecycle: &mut Lifecycle,
     source: EventSource,
     virtual_camera: &mut VirtualCamera,
+    address_monitor: &AddressMonitor,
+    api_probe: &mut Option<ApiProbeFuture>,
 ) -> Result<()> {
     let cameras = enumerate_usb_cameras()?;
     let networks = enumerate_gopro_networks()?;
-    reconcile_inventory(lifecycle, source, cameras, networks, virtual_camera)
+    reconcile_inventory(lifecycle, source, cameras, networks, virtual_camera)?;
+    if lifecycle.state.kind() != CameraStateKind::WaitingForApi {
+        *api_probe = None;
+    }
+    refresh_selected_addresses(lifecycle, virtual_camera, address_monitor, api_probe).await
+}
+
+/// Reconciles the selected interface's address inventory after udev discovery
+/// or an IPv4 netlink notification. This replaces timing-dependent sleeps.
+async fn refresh_selected_addresses(
+    lifecycle: &mut Lifecycle,
+    virtual_camera: &mut VirtualCamera,
+    address_monitor: &AddressMonitor,
+    api_probe: &mut Option<ApiProbeFuture>,
+) -> Result<()> {
+    let Some(network) = lifecycle.selected_network() else {
+        return Ok(());
+    };
+    let ifindex = network.ifindex;
+    let addresses = address_monitor.addresses_for(ifindex).await?;
+    let events = lifecycle.apply(Observation::NetworkAddressesChanged { ifindex, addresses });
+    dispatch_runtime(lifecycle, events, virtual_camera, api_probe)
+}
+
+/// Dispatches state effects and keeps the single in-flight TCP probe aligned
+/// with lifecycle state. Dropping the future cancels a stale connect attempt.
+fn dispatch_runtime(
+    lifecycle: &Lifecycle,
+    events: Vec<LifecycleEvent>,
+    camera_output: &mut impl CameraOutput,
+    api_probe: &mut Option<ApiProbeFuture>,
+) -> Result<()> {
+    let request = api_probe_request(&events);
+    let waiting_for_api = lifecycle.state.kind() == CameraStateKind::WaitingForApi;
+    dispatch_all(events, camera_output)?;
+
+    if let Some((ifindex, endpoint)) = request {
+        *api_probe = Some(Box::pin(probe_control_endpoint(ifindex, endpoint)));
+    } else if !waiting_for_api {
+        *api_probe = None;
+    }
+    Ok(())
+}
+
+/// Extracts a newly requested probe from the transition that introduced its
+/// endpoint; metadata refreshes and failed probes never create blind retries.
+fn api_probe_request(events: &[LifecycleEvent]) -> Option<(u32, ControlEndpoint)> {
+    events.iter().find_map(|event| match event {
+        LifecycleEvent::StateTransition {
+            to: CameraStateKind::WaitingForApi,
+            network: Some(network),
+            endpoint: Some(endpoint),
+            ..
+        } => Some((network.ifindex, *endpoint)),
+        _ => None,
+    })
+}
+
+/// Waits for the active probe, or forever when no probe is active so the
+/// select loop remains event-driven without a periodic wake-up.
+async fn next_api_probe(probe: &mut Option<ApiProbeFuture>) -> ApiProbeResult {
+    match probe {
+        Some(probe) => probe.await,
+        None => future::pending().await,
+    }
+}
+
+/// Verifies that the GoPro control TCP port accepts a connection. A timeout is
+/// a bounded readiness result, not a retry loop; the kernel owns SYN retries.
+async fn probe_control_endpoint(ifindex: u32, endpoint: ControlEndpoint) -> ApiProbeResult {
+    let result = match TcpSocket::new_v4().and_then(|socket| {
+        socket.bind(SocketAddr::new(IpAddr::V4(endpoint.host_address), 0))?;
+        Ok(socket)
+    }) {
+        Ok(socket) => match timeout(
+            GOPRO_CONNECT_TIMEOUT,
+            socket.connect(SocketAddr::V4(endpoint.socket_address())),
+        )
+        .await
+        {
+            Ok(Ok(_stream)) => Ok(()),
+            Ok(Err(error)) => Err(format!(
+                "TCP connection to {}:{} failed: {error}",
+                endpoint.control_address, GOPRO_CONTROL_PORT
+            )),
+            Err(_) => Err(format!(
+                "TCP connection to {}:{} timed out after {} seconds",
+                endpoint.control_address,
+                GOPRO_CONTROL_PORT,
+                GOPRO_CONNECT_TIMEOUT.as_secs()
+            )),
+        },
+        Err(error) => Err(format!(
+            "failed to bind TCP probe to GoPro host address {}: {error}",
+            endpoint.host_address
+        )),
+    };
+    ApiProbeResult {
+        ifindex,
+        endpoint,
+        result,
+    }
 }
 
 /// Applies one complete sysfs inventory in the same order used at daemon
@@ -689,7 +1039,7 @@ fn reconcile_inventory(
             lifecycle.apply(Observation::NetworkRemoved {
                 sysfs_path: current.sysfs_path,
                 name: Some(current.name),
-                ifindex: current.ifindex,
+                ifindex: Some(current.ifindex),
                 usb_path: Some(current.usb_path),
             }),
             camera_output,
@@ -764,6 +1114,7 @@ fn dispatch_all(events: Vec<LifecycleEvent>, camera_output: &mut impl CameraOutp
                 to,
                 camera,
                 network,
+                endpoint,
                 source,
             } => {
                 if to == CameraStateKind::DeviceDetected {
@@ -790,7 +1141,9 @@ fn dispatch_all(events: Vec<LifecycleEvent>, camera_output: &mut impl CameraOutp
                     usb_id = camera.map(usb_id).unwrap_or_else(|| "unknown".to_owned()),
                     usb_path = camera.map(|value| value.usb_path.display().to_string()).unwrap_or_else(|| "unknown".to_owned()),
                     interface = network.map(|value| value.name.as_str()).unwrap_or("unknown"),
-                    ifindex = network.and_then(|value| value.ifindex).map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
+                    ifindex = network.map_or_else(|| "unknown".to_owned(), |value| value.ifindex.to_string()),
+                    host_address = endpoint.map(|value| value.host_address.to_string()).unwrap_or_else(|| "unknown".to_owned()),
+                    control_address = endpoint.map(|value| value.control_address.to_string()).unwrap_or_else(|| "unknown".to_owned()),
                     "GoPro lifecycle state changed"
                 );
             }
@@ -810,12 +1163,22 @@ fn dispatch_all(events: Vec<LifecycleEvent>, camera_output: &mut impl CameraOutp
                     event = "network_interface_updated",
                     previous_interface = %previous.name,
                     interface = %current.name,
-                    ifindex = current.ifindex.map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
+                    ifindex = current.ifindex,
                     mac = current.mac_address.as_deref().unwrap_or("unknown"),
                     driver = current.driver.as_deref().unwrap_or("unknown"),
                     network_path = %current.sysfs_path.display(),
                     usb_path = %current.usb_path.display(),
                     "GoPro USB network interface metadata changed"
+                );
+            }
+            LifecycleEvent::ApiProbeFailed { endpoint, error } => {
+                warn!(
+                    event = "gopro_api_probe_failed",
+                    host_address = %endpoint.host_address,
+                    control_address = %endpoint.control_address,
+                    port = GOPRO_CONTROL_PORT,
+                    %error,
+                    "GoPro control API is not reachable yet; waiting for a network change"
                 );
             }
         }
@@ -917,7 +1280,7 @@ mod tests {
         NetworkInterface {
             sysfs_path: PathBuf::from(path),
             name: name.to_owned(),
-            ifindex: Some(7),
+            ifindex: 7,
             mac_address: Some("02:00:00:00:00:01".to_owned()),
             driver: Some("cdc_ncm".to_owned()),
             usb_path: PathBuf::from(usb_path),
@@ -929,7 +1292,9 @@ mod tests {
             .iter()
             .filter_map(|event| match event {
                 LifecycleEvent::StateTransition { from, to, .. } => Some((*from, *to)),
-                LifecycleEvent::CameraIgnored(_) | LifecycleEvent::NetworkUpdated { .. } => None,
+                LifecycleEvent::CameraIgnored(_)
+                | LifecycleEvent::NetworkUpdated { .. }
+                | LifecycleEvent::ApiProbeFailed { .. } => None,
             })
             .collect()
     }
@@ -949,6 +1314,7 @@ mod tests {
                     to: CameraStateKind::DeviceDetected,
                     camera: Some(identity.clone()),
                     network: None,
+                    endpoint: None,
                     source: Some(EventSource::Startup),
                 },
                 LifecycleEvent::StateTransition {
@@ -956,27 +1322,45 @@ mod tests {
                     to: CameraStateKind::WaitingForNetwork,
                     camera: Some(identity.clone()),
                     network: None,
+                    endpoint: None,
                     source: Some(EventSource::Startup),
                 },
                 LifecycleEvent::StateTransition {
                     from: CameraStateKind::WaitingForNetwork,
+                    to: CameraStateKind::WaitingForAddress,
+                    camera: Some(identity.clone()),
+                    network: Some(interface.clone()),
+                    endpoint: None,
+                    source: None,
+                },
+                LifecycleEvent::StateTransition {
+                    from: CameraStateKind::WaitingForAddress,
+                    to: CameraStateKind::WaitingForApi,
+                    camera: Some(identity.clone()),
+                    network: Some(interface.clone()),
+                    endpoint: Some(ControlEndpoint::from_host_address(Ipv4Addr::new(
+                        172, 27, 187, 52,
+                    ))),
+                    source: None,
+                },
+                LifecycleEvent::StateTransition {
+                    from: CameraStateKind::WaitingForApi,
                     to: CameraStateKind::Ready,
                     camera: Some(identity.clone()),
                     network: Some(interface.clone()),
+                    endpoint: Some(ControlEndpoint::from_host_address(Ipv4Addr::new(
+                        172, 27, 187, 52,
+                    ))),
                     source: None,
                 },
                 LifecycleEvent::StateTransition {
                     from: CameraStateKind::Ready,
-                    to: CameraStateKind::Streaming,
-                    camera: Some(identity.clone()),
-                    network: Some(interface.clone()),
-                    source: None,
-                },
-                LifecycleEvent::StateTransition {
-                    from: CameraStateKind::Streaming,
                     to: CameraStateKind::Disconnected,
                     camera: Some(identity),
                     network: Some(interface),
+                    endpoint: Some(ControlEndpoint::from_host_address(Ipv4Addr::new(
+                        172, 27, 187, 52,
+                    ))),
                     source: None,
                 },
             ],
@@ -1002,6 +1386,7 @@ mod tests {
                 to: CameraStateKind::DeviceDetected,
                 camera: Some(camera("/sys/camera-a", None)),
                 network: None,
+                endpoint: None,
                 source: Some(EventSource::Udev),
             }],
             &mut output,
@@ -1014,7 +1399,7 @@ mod tests {
 
     /// Verifies the requested state sequence and exact black-output boundary.
     #[test]
-    fn usb_and_network_observations_reach_streaming() {
+    fn usb_network_address_and_api_observations_reach_ready() {
         let mut lifecycle = Lifecycle::default();
         let first = camera("/sys/camera-a", Some("C123"));
         let interface = network("/sys/net/enx1", "/sys/camera-a", "enx1");
@@ -1041,18 +1426,113 @@ mod tests {
         assert_eq!(output.starts, 1);
         assert_eq!(lifecycle.state.kind(), CameraStateKind::WaitingForNetwork);
 
-        let ready = lifecycle.apply(Observation::NetworkUpsert(interface));
+        let waiting_for_address = lifecycle.apply(Observation::NetworkUpsert(interface));
+        assert_eq!(
+            transition_kinds(&waiting_for_address),
+            vec![(
+                CameraStateKind::WaitingForNetwork,
+                CameraStateKind::WaitingForAddress
+            )]
+        );
+        dispatch_all(waiting_for_address, &mut output).unwrap();
+        let endpoint = ControlEndpoint::from_host_address(Ipv4Addr::new(172, 27, 187, 52));
+        let waiting_for_api = lifecycle.apply(Observation::NetworkAddressesChanged {
+            ifindex: 7,
+            addresses: vec![endpoint.host_address],
+        });
+        assert_eq!(
+            transition_kinds(&waiting_for_api),
+            vec![(
+                CameraStateKind::WaitingForAddress,
+                CameraStateKind::WaitingForApi
+            )]
+        );
+        dispatch_all(waiting_for_api, &mut output).unwrap();
+        let ready = lifecycle.apply(Observation::ApiProbeSucceeded {
+            ifindex: 7,
+            endpoint,
+        });
         assert_eq!(
             transition_kinds(&ready),
-            vec![
-                (CameraStateKind::WaitingForNetwork, CameraStateKind::Ready),
-                (CameraStateKind::Ready, CameraStateKind::Streaming),
-            ]
+            vec![(CameraStateKind::WaitingForApi, CameraStateKind::Ready)]
         );
         dispatch_all(ready, &mut output).unwrap();
         assert_eq!(output.starts, 1);
         assert_eq!(output.stops, 0);
-        assert_eq!(lifecycle.state.kind(), CameraStateKind::Streaming);
+        assert_eq!(lifecycle.state.kind(), CameraStateKind::Ready);
+    }
+
+    /// Verifies address ownership, endpoint derivation, stale probe results,
+    /// and API failure handling without depending on a real GoPro or netlink
+    /// namespace in the unit test process.
+    #[test]
+    fn address_and_api_events_are_scoped_to_the_selected_interface() {
+        let identity = camera("/sys/camera-a", Some("C123"));
+        let interface = network("/sys/net/enx1", "/sys/camera-a", "enx1");
+        let endpoint = ControlEndpoint::from_host_address(Ipv4Addr::new(172, 27, 187, 52));
+        let mut lifecycle = Lifecycle::default();
+
+        lifecycle.apply(Observation::UsbUpsert {
+            camera: identity,
+            source: EventSource::Startup,
+        });
+        lifecycle.apply(Observation::NetworkUpsert(interface));
+        assert!(
+            lifecycle
+                .apply(Observation::NetworkAddressesChanged {
+                    ifindex: 99,
+                    addresses: vec![endpoint.host_address],
+                })
+                .is_empty()
+        );
+        assert_eq!(lifecycle.state.kind(), CameraStateKind::WaitingForAddress);
+
+        assert_eq!(
+            transition_kinds(&lifecycle.apply(Observation::NetworkAddressesChanged {
+                ifindex: 7,
+                addresses: vec![endpoint.host_address],
+            })),
+            vec![(
+                CameraStateKind::WaitingForAddress,
+                CameraStateKind::WaitingForApi
+            )]
+        );
+        assert_eq!(lifecycle.state.endpoint(), Some(endpoint));
+        assert_eq!(endpoint.control_address, Ipv4Addr::new(172, 27, 187, 51));
+
+        let failure = lifecycle.apply(Observation::ApiProbeFailed {
+            ifindex: 7,
+            endpoint,
+            error: "connection refused".to_owned(),
+        });
+        assert!(matches!(
+            failure.as_slice(),
+            [LifecycleEvent::ApiProbeFailed { .. }]
+        ));
+        assert_eq!(lifecycle.state.kind(), CameraStateKind::WaitingForApi);
+        assert!(
+            lifecycle
+                .apply(Observation::ApiProbeSucceeded {
+                    ifindex: 99,
+                    endpoint,
+                })
+                .is_empty()
+        );
+        assert_eq!(lifecycle.state.kind(), CameraStateKind::WaitingForApi);
+
+        lifecycle.apply(Observation::NetworkAddressesChanged {
+            ifindex: 7,
+            addresses: Vec::new(),
+        });
+        assert_eq!(lifecycle.state.kind(), CameraStateKind::WaitingForAddress);
+        assert!(
+            lifecycle
+                .apply(Observation::ApiProbeSucceeded {
+                    ifindex: 7,
+                    endpoint,
+                })
+                .is_empty()
+        );
     }
 
     /// Verifies repeated udev observations do not emit duplicate transitions.
@@ -1112,6 +1592,7 @@ mod tests {
     fn usb_removal_reaches_disconnected_from_every_connected_state() {
         let identity = camera("/sys/camera-a", Some("C123"));
         let interface = network("/sys/net/enx1", "/sys/camera-a", "enx1");
+        let endpoint = ControlEndpoint::from_host_address(Ipv4Addr::new(172, 27, 187, 52));
         let states = [
             CameraState::DeviceDetected {
                 camera: identity.clone(),
@@ -1119,13 +1600,19 @@ mod tests {
             CameraState::WaitingForNetwork {
                 camera: identity.clone(),
             },
-            CameraState::Ready {
+            CameraState::WaitingForAddress {
                 camera: identity.clone(),
                 network: interface.clone(),
             },
-            CameraState::Streaming {
+            CameraState::WaitingForApi {
                 camera: identity.clone(),
                 network: interface.clone(),
+                endpoint,
+            },
+            CameraState::Ready {
+                camera: identity.clone(),
+                network: interface.clone(),
+                endpoint,
             },
         ];
 
@@ -1146,19 +1633,27 @@ mod tests {
         }
     }
 
-    /// Verifies loss of the selected interface ends either post-network phase.
+    /// Verifies network loss preserves the physical camera session and returns
+    /// it to the interface-waiting phase.
     #[test]
-    fn network_removal_reaches_disconnected_from_ready_and_streaming() {
+    fn network_removal_returns_to_waiting_for_network() {
         let identity = camera("/sys/camera-a", Some("C123"));
         let interface = network("/sys/net/enx1", "/sys/camera-a", "enx1");
+        let endpoint = ControlEndpoint::from_host_address(Ipv4Addr::new(172, 27, 187, 52));
         let states = [
-            CameraState::Ready {
+            CameraState::WaitingForAddress {
                 camera: identity.clone(),
                 network: interface.clone(),
             },
-            CameraState::Streaming {
+            CameraState::WaitingForApi {
                 camera: identity.clone(),
                 network: interface.clone(),
+                endpoint,
+            },
+            CameraState::Ready {
+                camera: identity.clone(),
+                network: interface.clone(),
+                endpoint,
             },
         ];
 
@@ -1171,14 +1666,14 @@ mod tests {
             let events = lifecycle.apply(Observation::NetworkRemoved {
                 sysfs_path: interface.sysfs_path.clone(),
                 name: Some(interface.name.clone()),
-                ifindex: interface.ifindex,
+                ifindex: Some(interface.ifindex),
                 usb_path: Some(identity.usb_path.clone()),
             });
             assert_eq!(
                 transition_kinds(&events),
-                vec![(from, CameraStateKind::Disconnected)]
+                vec![(from, CameraStateKind::WaitingForNetwork)]
             );
-            assert_eq!(lifecycle.state.kind(), CameraStateKind::Disconnected);
+            assert_eq!(lifecycle.state.kind(), CameraStateKind::WaitingForNetwork);
         }
     }
 
@@ -1221,10 +1716,10 @@ mod tests {
         });
         assert_eq!(
             transition_kinds(&lifecycle.apply(Observation::NetworkUpsert(interface))),
-            vec![
-                (CameraStateKind::WaitingForNetwork, CameraStateKind::Ready),
-                (CameraStateKind::Ready, CameraStateKind::Streaming),
-            ]
+            vec![(
+                CameraStateKind::WaitingForNetwork,
+                CameraStateKind::WaitingForAddress
+            )]
         );
     }
 
@@ -1300,10 +1795,10 @@ mod tests {
         );
     }
 
-    /// Verifies loss of the selected USB network tears down the session and a
-    /// later USB/network observation creates a fresh black-frame session.
+    /// Verifies loss of the selected USB network retains black output and a
+    /// later network observation restores the address-waiting phase.
     #[test]
-    fn network_loss_disconnects_and_network_reappearance_reconnects() {
+    fn network_loss_keeps_black_output_until_usb_disconnect() {
         let identity = camera("/sys/camera-a", Some("C123"));
         let interface = network("/sys/net/enx1", "/sys/camera-a", "enx1");
         let mut lifecycle = Lifecycle::default();
@@ -1326,37 +1821,32 @@ mod tests {
         let disconnected = lifecycle.apply(Observation::NetworkRemoved {
             sysfs_path: interface.sysfs_path.clone(),
             name: Some(interface.name.clone()),
-            ifindex: interface.ifindex,
+            ifindex: Some(interface.ifindex),
             usb_path: Some(identity.usb_path.clone()),
         });
         assert_eq!(
             transition_kinds(&disconnected),
-            vec![(CameraStateKind::Streaming, CameraStateKind::Disconnected)]
+            vec![(
+                CameraStateKind::WaitingForAddress,
+                CameraStateKind::WaitingForNetwork
+            )]
         );
         dispatch_all(disconnected, &mut output).unwrap();
-        assert_eq!((output.starts, output.stops), (1, 1));
+        assert_eq!((output.starts, output.stops), (1, 0));
 
-        dispatch_all(
-            lifecycle.apply(Observation::UsbUpsert {
-                camera: identity,
-                source: EventSource::Udev,
-            }),
-            &mut output,
-        )
-        .unwrap();
         dispatch_all(
             lifecycle.apply(Observation::NetworkUpsert(interface)),
             &mut output,
         )
         .unwrap();
-        assert_eq!((output.starts, output.stops), (2, 1));
-        assert_eq!(lifecycle.state.kind(), CameraStateKind::Streaming);
+        assert_eq!((output.starts, output.stops), (1, 0));
+        assert_eq!(lifecycle.state.kind(), CameraStateKind::WaitingForAddress);
     }
 
     /// Verifies a daemon restart reconciles an already-connected GoPro into
-    /// streaming state without waiting for a future udev event.
+    /// address-waiting state without waiting for a future udev event.
     #[test]
-    fn startup_inventory_with_camera_and_network_reaches_streaming() {
+    fn startup_inventory_with_camera_and_network_reaches_waiting_for_address() {
         let identity = camera("/sys/camera-a", Some("C123"));
         let interface = network("/sys/net/enx1", "/sys/camera-a", "enx1");
         let mut lifecycle = Lifecycle::default();
@@ -1371,7 +1861,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(lifecycle.state.kind(), CameraStateKind::Streaming);
+        assert_eq!(lifecycle.state.kind(), CameraStateKind::WaitingForAddress);
         assert_eq!((output.starts, output.stops), (1, 0));
     }
 

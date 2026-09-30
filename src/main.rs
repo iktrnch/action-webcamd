@@ -1,4 +1,5 @@
 mod hotplug;
+mod network;
 mod settings;
 mod virtual_camera;
 
