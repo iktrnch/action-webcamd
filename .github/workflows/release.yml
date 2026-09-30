@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      ci_run_id: ${{ steps.ci_run.outputs.ci_run_id }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Validate release tag version
+        run: scripts/ci/check-release-version.sh '${{ github.ref_name }}'
+      - name: Find successful main CI run for exact commit
+        id: ci_run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci/find-successful-ci-run.sh ci.yml main
+
+  github-release:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.prepare.outputs.ci_run_id }}
+          name: linux-packages
+          path: release-assets
+      - name: Create GitHub Release from tested packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci/create-github-release.sh '${{ github.ref_name }}' release-assets
+
+  aur:
+    needs: github-release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref }}
+      - name: Configure AUR SSH key
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: scripts/ci/configure-aur-ssh.sh
+      - name: Generate and push AUR package update
+        run: scripts/ci/publish-aur.sh

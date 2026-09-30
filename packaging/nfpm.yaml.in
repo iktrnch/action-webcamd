@@ -1,0 +1,40 @@
+name: action-webcamd
+arch: @ARCH@
+platform: linux
+version: "@VERSION@"
+release: "1"
+section: video
+priority: optional
+maintainer: iktrnch
+description: Native Linux webcam service for compatible GoPro cameras.
+license: MIT
+homepage: https://github.com/iktrnch/action-webcamd
+scripts:
+  postinstall: packaging/postinstall.sh
+  postremove: packaging/postremove.sh
+overrides:
+  deb:
+    depends:
+      - ffmpeg
+      - libudev1
+      - systemd
+    recommends:
+      - v4l2loopback-dkms
+  rpm:
+    depends:
+      - ffmpeg-free
+      - systemd
+      - systemd-libs
+contents:
+  - src: @BINARY@
+    dst: /usr/bin/action-webcamd
+    file_info:
+      mode: 0755
+  - src: packaging/action-webcamd.service
+    dst: /usr/lib/systemd/system/action-webcamd.service
+    file_info:
+      mode: 0644
+  - src: README.md
+    dst: /usr/share/doc/action-webcamd/README.md
+  - src: LICENSE
+    dst: /usr/share/licenses/action-webcamd/LICENSE
