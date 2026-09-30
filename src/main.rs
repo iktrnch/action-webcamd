@@ -11,7 +11,9 @@ use tracing_subscriber::EnvFilter;
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     init_tracing();
-    let (virtual_camera, producer_failures) = virtual_camera::VirtualCamera::prepare()?;
+    let settings = settings::Settings::load()?;
+    let (virtual_camera, producer_failures) =
+        virtual_camera::VirtualCamera::prepare(settings.virtual_camera)?;
     hotplug::run(virtual_camera, producer_failures).await
 }
 

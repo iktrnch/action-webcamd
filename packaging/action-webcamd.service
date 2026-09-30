@@ -1,0 +1,12 @@
+[Unit]
+Description=Linux Action Camera Webcam Service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/action-webcamd
+
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -17,7 +17,7 @@ use v4l::{Device, Format, FourCC};
 use v4l::{format::colorspace::Colorspace, format::quantization::Quantization};
 use v4l::{video::Output, video::output::Parameters};
 
-use crate::settings::{VIDEO_DEVICE_LABEL, VIDEO_FPS, VIDEO_HEIGHT, VIDEO_WIDTH};
+use crate::settings::{VIDEO_FPS, VIDEO_HEIGHT, VIDEO_WIDTH, VirtualCameraSettings};
 
 const LOOPBACK_DRIVER: &str = "v4l2 loopback";
 const VIDEO_CLASS: &str = "/sys/class/video4linux";
@@ -96,6 +96,7 @@ pub(crate) trait CameraOutput {
 /// Owns the persistent virtual-device path and at most one frame producer.
 pub(crate) struct VirtualCamera {
     device_path: PathBuf,
+    label: String,
     producer: Option<Producer>,
     frames: FrameSink,
     failures: UnboundedSender<anyhow::Error>,
@@ -103,13 +104,15 @@ pub(crate) struct VirtualCamera {
 
 impl VirtualCamera {
     /// Finds the administrator-provisioned virtual device before hotplug discovery.
-    pub(crate) fn prepare() -> Result<(Self, UnboundedReceiver<anyhow::Error>)> {
-        let device_path = require_existing_device()?;
+    pub(crate) fn prepare(
+        settings: VirtualCameraSettings,
+    ) -> Result<(Self, UnboundedReceiver<anyhow::Error>)> {
+        let device_path = require_existing_device(&settings.label)?;
         let (failures, receiver) = unbounded_channel();
 
         info!(
             event = "virtual_camera_ready",
-            label = VIDEO_DEVICE_LABEL,
+            label = %settings.label,
             device = %device_path.display(),
             width = VIDEO_WIDTH,
             height = VIDEO_HEIGHT,
@@ -121,6 +124,7 @@ impl VirtualCamera {
         Ok((
             Self {
                 device_path,
+                label: settings.label,
                 producer: None,
                 frames: FrameSink::default(),
                 failures,
@@ -147,7 +151,7 @@ impl CameraOutput for VirtualCamera {
             return Ok(());
         }
 
-        let device = configure_output(&self.device_path)?;
+        let device = configure_output(&self.device_path, &self.label)?;
         let producer = Producer::spawn(
             device,
             self.device_path.clone(),
@@ -159,6 +163,7 @@ impl CameraOutput for VirtualCamera {
         info!(
             event = "virtual_camera_feed_started",
             device = %self.device_path.display(),
+            label = %self.label,
             width = VIDEO_WIDTH,
             height = VIDEO_HEIGHT,
             fps = VIDEO_FPS,
@@ -232,15 +237,15 @@ impl Producer {
 }
 
 /// Locates one administrator-provisioned video node with the configured label.
-fn require_existing_device() -> Result<PathBuf> {
+fn require_existing_device(label: &str) -> Result<PathBuf> {
     find_labelled_device(
         Path::new(VIDEO_CLASS),
         Path::new("/dev"),
-        VIDEO_DEVICE_LABEL,
+        label,
     )?
     .with_context(|| {
         format!(
-            "no V4L2 device labelled {VIDEO_DEVICE_LABEL:?} was found; provision v4l2loopback separately with exclusive_caps=1 and grant this user read/write access to its /dev/videoX node"
+            "no V4L2 device labelled {label:?} was found; provision v4l2loopback separately with exclusive_caps=1 and grant this user read/write access to its /dev/videoX node"
         )
     })
 }
@@ -315,7 +320,7 @@ fn parse_video_number(name: &std::ffi::OsStr) -> Option<i32> {
 }
 
 /// Opens the output node and verifies exact format and frame-rate negotiation.
-fn configure_output(path: &Path) -> Result<Device> {
+fn configure_output(path: &Path, label: &str) -> Result<Device> {
     let device = Device::with_path(path)
         .with_context(|| format!("failed to open virtual camera {}", path.display()))?;
     let capabilities = device
@@ -328,11 +333,11 @@ fn configure_output(path: &Path) -> Result<Device> {
         capabilities.driver
     );
     ensure!(
-        capabilities.card == VIDEO_DEVICE_LABEL,
+        capabilities.card == label,
         "{} has card label {:?}, expected {:?}",
         path.display(),
         capabilities.card,
-        VIDEO_DEVICE_LABEL
+        label
     );
 
     let yuv420_fourcc = FourCC::new(YUV420_FOURCC_BYTES);
@@ -457,6 +462,8 @@ mod tests {
 
     use super::*;
 
+    const TEST_VIDEO_DEVICE_LABEL: &str = "GoPro Webcam";
+
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
     struct VideoFixture {
@@ -517,10 +524,14 @@ mod tests {
     #[test]
     fn labelled_device_is_found_without_opening_module_control() {
         let fixture = VideoFixture::new();
-        fixture.add_video(42, VIDEO_DEVICE_LABEL, true);
+        fixture.add_video(42, TEST_VIDEO_DEVICE_LABEL, true);
 
-        let path = find_labelled_device(&fixture.video_class, &fixture.devices, VIDEO_DEVICE_LABEL)
-            .unwrap();
+        let path = find_labelled_device(
+            &fixture.video_class,
+            &fixture.devices,
+            TEST_VIDEO_DEVICE_LABEL,
+        )
+        .unwrap();
 
         assert_eq!(path, Some(fixture.devices.join("video42")));
     }
@@ -531,8 +542,12 @@ mod tests {
         fixture.add_video(42, "Other camera", true);
 
         assert_eq!(
-            find_labelled_device(&fixture.video_class, &fixture.devices, VIDEO_DEVICE_LABEL,)
-                .unwrap(),
+            find_labelled_device(
+                &fixture.video_class,
+                &fixture.devices,
+                TEST_VIDEO_DEVICE_LABEL,
+            )
+            .unwrap(),
             None
         );
     }
@@ -540,12 +555,15 @@ mod tests {
     #[test]
     fn duplicate_labels_are_rejected() {
         let fixture = VideoFixture::new();
-        fixture.add_video(42, VIDEO_DEVICE_LABEL, true);
-        fixture.add_video(43, VIDEO_DEVICE_LABEL, true);
+        fixture.add_video(42, TEST_VIDEO_DEVICE_LABEL, true);
+        fixture.add_video(43, TEST_VIDEO_DEVICE_LABEL, true);
 
-        let error =
-            find_labelled_device(&fixture.video_class, &fixture.devices, VIDEO_DEVICE_LABEL)
-                .unwrap_err();
+        let error = find_labelled_device(
+            &fixture.video_class,
+            &fixture.devices,
+            TEST_VIDEO_DEVICE_LABEL,
+        )
+        .unwrap_err();
 
         assert!(error.to_string().contains("multiple V4L2 devices"));
     }
@@ -553,11 +571,14 @@ mod tests {
     #[test]
     fn labelled_sysfs_entry_without_device_node_is_rejected() {
         let fixture = VideoFixture::new();
-        fixture.add_video(42, VIDEO_DEVICE_LABEL, false);
+        fixture.add_video(42, TEST_VIDEO_DEVICE_LABEL, false);
 
-        let error =
-            find_labelled_device(&fixture.video_class, &fixture.devices, VIDEO_DEVICE_LABEL)
-                .unwrap_err();
+        let error = find_labelled_device(
+            &fixture.video_class,
+            &fixture.devices,
+            TEST_VIDEO_DEVICE_LABEL,
+        )
+        .unwrap_err();
 
         assert!(error.to_string().contains("device node is missing"));
     }
@@ -619,6 +640,7 @@ mod tests {
         let (failures, _receiver) = unbounded_channel();
         let camera = VirtualCamera {
             device_path: PathBuf::from("/dev/video42"),
+            label: TEST_VIDEO_DEVICE_LABEL.to_owned(),
             producer: None,
             frames: FrameSink::default(),
             failures,

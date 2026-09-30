@@ -1,6 +1,6 @@
 # AGENTS.md
 
-This repository implements a native Linux GoPro webcam service in Rust.
+This repository implements a native Linux webcam service for GoPro cameras.
 
 The goal is to provide Windows-like plug-and-play behaviour:
 
